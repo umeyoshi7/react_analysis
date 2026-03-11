@@ -6,34 +6,27 @@ Streamlit entry point
 from __future__ import annotations
 
 import io
-import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+from src.analysis import run_analysis
 from src.data_loader import (
+    auto_detect_reaction_type,
     check_mass_balance,
     get_temperature_groups,
     load_experiment_data,
 )
-from src.kinetics import (
-    FullAnalysisResult,
-    auto_detect_reaction_type,
-    run_full_analysis,
-)
+from src.models import AnalysisResult
 from src.plotting import (
     plot_arrhenius,
-    plot_best_fit_conc,
-    plot_integral_fit,
-    plot_lsq_fit,
+    plot_fit,
     plot_multi_species,
-    plot_order_per_temp,
     plot_raw,
     plot_raw_multi_temp,
-    plot_residuals,
-    plot_rk4lsq_fit,
+    plot_residuals_rk4,
 )
 from src.reporter import generate_excel_report
 
@@ -47,7 +40,7 @@ st.set_page_config(
 )
 
 TEMPLATE_PATH = Path(__file__).parent / "template" / "experiment_template.xlsx"
-ORDER_LABELS  = {0: "0次反応", 1: "1次反応", 2: "2次反応"}
+
 REACTION_TYPE_LABELS = {
     "simple":     "単純反応 A→products",
     "sequential": "逐次反応 A→B→C",
@@ -75,7 +68,6 @@ def _init_state() -> None:
     defaults = {
         "file_key":          None,
         "uploaded_df":       None,
-        "metadata":          {},
         "analysis_results":  None,
         "analysis_complete": False,
         "load_warnings":     [],
@@ -102,26 +94,44 @@ with st.sidebar:
 
     # Template download
     st.subheader("1. テンプレートDL")
-    if TEMPLATE_PATH.exists():
-        with open(TEMPLATE_PATH, "rb") as f:
-            st.download_button(
-                label="📥 Excelテンプレートをダウンロード",
-                data=f.read(),
-                file_name="experiment_template.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-    else:
-        st.warning("テンプレートファイルが見つかりません。")
+    col_dl1, col_dl2 = st.columns(2)
+    with col_dl1:
+        if TEMPLATE_PATH.exists():
+            with open(TEMPLATE_PATH, "rb") as f:
+                st.download_button(
+                    label="📥 Excel",
+                    data=f.read(),
+                    file_name="experiment_template.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+    with col_dl2:
+        csv_header = "time,concentration,concentration_B,concentration_C,temperature,notes\n"
+        csv_sample = (
+            "0,1.0,,,25.0,開始\n"
+            "5,0.778,,,25.0,\n"
+            "10,0.607,,,25.0,\n"
+            "20,0.368,,,25.0,\n"
+            "30,0.223,,,25.0,\n"
+            "60,0.050,,,25.0,終了\n"
+        )
+        st.download_button(
+            label="📥 CSV",
+            data=(csv_header + csv_sample).encode("utf-8"),
+            file_name="experiment_template.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
     st.markdown("---")
 
     # File upload
     st.subheader("2. データアップロード")
     uploaded_file = st.file_uploader(
-        "実験データ (.xlsx)",
-        type=["xlsx"],
+        "実験データ (.xlsx / .csv)",
+        type=["xlsx", "csv"],
         help=(
-            "テンプレートに従って入力したExcelファイルをアップロードしてください。\n\n"
+            "ExcelまたはCSVファイルをアップロードしてください。\n\n"
             "**対応フォーマット:**\n"
             "- 単純反応: 濃度A列のみ\n"
             "- 逐次/並列反応: 濃度A+B（+C）列\n"
@@ -138,18 +148,18 @@ with st.sidebar:
             st.session_state["analysis_results"]  = None
             with st.spinner("ファイルを読み込み中…"):
                 try:
-                    df, metadata, load_warnings = load_experiment_data(
-                        io.BytesIO(uploaded_file.getvalue())
+                    df, _, load_warnings = load_experiment_data(
+                        io.BytesIO(uploaded_file.getvalue()),
+                        filename=uploaded_file.name,
                     )
                     temp_groups   = get_temperature_groups(df)
                     detected_type, detected_reason = auto_detect_reaction_type(df)
                     mb_ok, mb_cv  = check_mass_balance(df)
 
                     st.session_state.update({
-                        "uploaded_df":   df,
-                        "metadata":      metadata,
-                        "load_warnings": load_warnings,
-                        "temp_groups":   temp_groups,
+                        "uploaded_df":     df,
+                        "load_warnings":   load_warnings,
+                        "temp_groups":     temp_groups,
                         "detected_type":   detected_type,
                         "detected_reason": detected_reason,
                         "mass_balance_ok": mb_ok,
@@ -159,8 +169,7 @@ with st.sidebar:
                     n_valid_A = df["concentration"].notna().sum()
                     st.success(f"✅ {len(df)} 行 (濃度A: {n_valid_A}点) 読み込みました。")
 
-                    has_B = "concentration_B" in df.columns
-                    has_C = "concentration_C" in df.columns
+                    has_B  = "concentration_B" in df.columns
                     n_temps = len(temp_groups)
 
                     if has_B:
@@ -178,26 +187,23 @@ with st.sidebar:
 
     # Analysis settings
     st.subheader("3. 解析設定")
+    st.caption("解析手法: RK4+最小二乗法（数値積分法）")
 
     df_loaded: pd.DataFrame | None = st.session_state["uploaded_df"]
     has_B_data = df_loaded is not None and "concentration_B" in df_loaded.columns and df_loaded["concentration_B"].notna().any()
     has_C_data = df_loaded is not None and "concentration_C" in df_loaded.columns and df_loaded["concentration_C"].notna().any()
     detected   = st.session_state.get("detected_type", "simple")
 
-    # Reaction type selectbox – available options based on data
-    rt_options  = ["single"]         # always
-    rt_labels   = ["単純反応 A→products"]
-    rt_values   = ["simple"]
+    # Reaction type selectbox
+    rt_labels = ["単純反応 A→products"]
+    rt_values = ["simple"]
     if has_B_data:
-        rt_options.append("seq")
         rt_labels.append("逐次反応 A→B→C")
         rt_values.append("sequential")
     if has_B_data and has_C_data:
-        rt_options.append("par")
         rt_labels.append("並列反応 A→B + A→C")
         rt_values.append("parallel")
 
-    # Suggest auto-detected type as default
     default_idx = rt_values.index(detected) if detected in rt_values else 0
     selected_label = st.selectbox(
         "反応タイプ",
@@ -209,22 +215,6 @@ with st.sidebar:
         ),
     )
     reaction_type = rt_values[rt_labels.index(selected_label)]
-
-    # Solver
-    if reaction_type == "simple":
-        solver_options = [
-            "全解法を実行",
-            "積分法のみ",
-            "最小二乗法（解析解）のみ",
-            "RK4法（ODE）のみ",
-        ]
-        solver_label  = st.selectbox("解法", solver_options)
-        enable_lsq    = solver_label in ("全解法を実行", "最小二乗法（解析解）のみ")
-        enable_rk4lsq = solver_label in ("全解法を実行", "RK4法（ODE）のみ")
-    else:
-        st.selectbox("解法", ["RK4法（ODE）"], disabled=True)
-        enable_lsq    = False
-        enable_rk4lsq = True
 
     st.markdown("---")
     run_btn = st.button(
@@ -242,12 +232,9 @@ if run_btn and st.session_state["uploaded_df"] is not None:
     with st.spinner("解析中…"):
         try:
             tg = st.session_state.get("temp_groups", {})
-            result = run_full_analysis(
+            result = run_analysis(
                 st.session_state["uploaded_df"],
                 reaction_type=reaction_type,
-                enable_lsq=enable_lsq,
-                enable_rk4=enable_rk4lsq,
-                enable_arrhenius=len(tg) >= 2,
                 temp_groups=tg if len(tg) >= 2 else None,
             )
             st.session_state["analysis_results"]  = result
@@ -262,47 +249,41 @@ if run_btn and st.session_state["uploaded_df"] is not None:
 st.title("⚗️ 反応速度定数・反応次数推算アプリ")
 
 if st.session_state["uploaded_df"] is None:
-    st.info("👈 サイドバーからExcelファイルをアップロードして解析を開始してください。")
+    st.info("👈 サイドバーからファイルをアップロードして解析を開始してください。")
     st.markdown(
         """
         **対応する解析タイプ:**
         | タイプ | 必要な列 | 解析手法 |
         |--------|----------|----------|
-        | 単純反応 A→products | 濃度A | 積分法・微分法・RK4 |
+        | 単純反応 A→products | 濃度A | RK4+最小二乗法（数値積分法） |
         | 逐次反応 A→B→C | 濃度A + 濃度B (+ 濃度C) | RK4+最小二乗法 |
         | 並列反応 A→B+A→C | 濃度A + 濃度B + 濃度C | RK4+最小二乗法 |
         | アレニウス解析 | 上記 + 複数温度点 | 線形回帰 |
 
-        **濃度データについて:**
-        - A, B, Cが異なる時間点で測定されている場合、他成分の欄を空白にしてください
-        - 濃度Aのみのデータは単純反応として解析します
-        - 濃度B/Cが全欠損の場合は自動的に除外します
+        **対応ファイル形式:** Excel (.xlsx) / CSV (.csv)
         """
     )
     st.stop()
 
-df: pd.DataFrame     = st.session_state["uploaded_df"]
-metadata: dict       = st.session_state["metadata"]
-load_warnings: list  = st.session_state.get("load_warnings", [])
-temp_groups: dict    = st.session_state.get("temp_groups", {})
-has_multi_species    = "concentration_B" in df.columns
-has_multi_temp       = len(temp_groups) > 1
+df: pd.DataFrame    = st.session_state["uploaded_df"]
+load_warnings: list = st.session_state.get("load_warnings", [])
+temp_groups: dict   = st.session_state.get("temp_groups", {})
+has_multi_species   = "concentration_B" in df.columns
+has_multi_temp      = len(temp_groups) > 1
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["📊 データ確認", "🔬 解析結果", "🌡️ Arrheniusパラメータ", "📄 レポート出力"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["📊 データ確認", "🔬 解析結果", "🌡️ Arrheniusパラメータ", "📄 レポート出力", "📖 解析ロジック・結果の読み取り方"]
 )
 
 # ===========================================================================
 # Tab 1: Data overview
 # ===========================================================================
 with tab1:
-    # Data quality summary
     col_info1, col_info2, col_info3 = st.columns(3)
     col_info1.metric("総行数", len(df))
     col_info2.metric("濃度A 有効点数", int(df["concentration"].notna().sum()))
     col_info3.metric("温度グループ数", len(temp_groups))
 
-    # Auto-detection info
     detected_type   = st.session_state.get("detected_type", "simple")
     detected_reason = st.session_state.get("detected_reason", "")
     mb_ok = st.session_state.get("mass_balance_ok")
@@ -314,25 +295,10 @@ with tab1:
     if mb_ok is not None and not mb_ok and has_multi_species:
         st.warning(
             f"⚠️ 質量バランス: A+B+C の変動係数 = {mb_cv:.3f} (閾値5% 超過)。"
-            "開放系反応または測定誤差の可能性があります。解析結果を参考値としてください。"
+            "開放系反応または測定誤差の可能性があります。"
         )
     elif mb_ok and has_multi_species:
         st.success(f"✅ 質量バランス OK (変動係数 = {mb_cv:.3f})")
-
-    if metadata:
-        st.subheader("実験条件")
-        meta_df = pd.DataFrame(
-            [{"項目": k, "値": v} for k, v in {
-                "実験名":           metadata.get("experiment_name", ""),
-                "反応物質":         metadata.get("substance", ""),
-                "初期濃度 (mol/L)": metadata.get("initial_concentration", ""),
-                "反応温度 (°C)":    metadata.get("temperature", ""),
-                "実験日":           str(metadata.get("experiment_date", "")),
-                "担当者":           metadata.get("operator", ""),
-                "備考":             metadata.get("notes", ""),
-            }.items()]
-        )
-        st.dataframe(meta_df, use_container_width=True, hide_index=True)
 
     if load_warnings:
         st.subheader("⚠️ データ品質警告")
@@ -353,7 +319,6 @@ with tab1:
     disp_df.columns = display_names[: len(disp_df.columns)]
     st.dataframe(disp_df, use_container_width=True, hide_index=True)
 
-    # Concentration plot
     st.subheader("濃度 vs. 時間")
     if has_multi_species:
         st.plotly_chart(plot_multi_species(df), use_container_width=True, key="tab1_multi_species")
@@ -361,7 +326,6 @@ with tab1:
             st.subheader(f"複数温度データ ({len(temp_groups)} 温度)")
             st.plotly_chart(plot_raw_multi_temp(temp_groups), use_container_width=True, key="tab1_multi_temp_species")
     elif has_multi_temp:
-        # Primary view for single-species multi-temperature data
         st.plotly_chart(plot_raw_multi_temp(temp_groups), use_container_width=True, key="tab1_multi_temp")
     else:
         st.plotly_chart(plot_raw(df), use_container_width=True, key="tab1_raw")
@@ -373,151 +337,73 @@ with tab1:
 with tab2:
     if not st.session_state["analysis_complete"]:
         st.info("サイドバーの「解析実行」ボタンを押してください。")
-        st.stop()
-
-    result: FullAnalysisResult = st.session_state["analysis_results"]
-    all_warnings = load_warnings + result.warnings
-
-    if all_warnings:
-        with st.expander("⚠️ 警告メッセージ", expanded=len(result.warnings) > 0):
-            for w in all_warnings:
-                st.warning(w)
-
-    # ---- Primary result: RK4 if available for non-simple, else integral ----
-    rk = result.rk4lsq
-    is_multi = rk is not None and rk.reaction_type in ("sequential", "parallel")
-
-    if is_multi and rk.success:
-        st.subheader("主要解析結果 (RK4+最小二乗法)")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("反応タイプ", REACTION_TYPE_LABELS.get(rk.reaction_type, rk.reaction_type))
-        m2.metric("速度定数 k1", f"{rk.k:.5f} min⁻¹")
-        if rk.k2 is not None:
-            m3.metric("速度定数 k2", f"{rk.k2:.5f} min⁻¹")
-        else:
-            m3.metric("推定次数 n", f"{rk.order:.4f}")
-        m4.metric("R²", f"{rk.r2:.5f}")
-        st.plotly_chart(plot_rk4lsq_fit(df, rk), use_container_width=True, key="tab2_primary_rk4")
     else:
-        st.subheader("主要解析結果 (積分法)")
-        best      = result.best_result
-        best_order = result.best_order
-        is_optimal_n = result.optimal_order_multi_temp is not None
-        ncols = 5 if is_optimal_n else 4
-        cols = st.columns(ncols)
-        cols[0].metric("推定反応次数", ORDER_LABELS[best_order])
-        cols[1].metric("速度定数 k",  f"{best.k:.5f} min⁻¹")
-        cols[2].metric("R²",          f"{best.r2:.5f}")
-        cols[3].metric("95%CI (k)",   f"[{best.k_ci_lower:.4f}, {best.k_ci_upper:.4f}]")
-        if is_optimal_n:
-            cols[4].metric("最適次数 n (多温度)", f"{result.optimal_order_multi_temp:.4f}")
-        st.plotly_chart(plot_best_fit_conc(df, result), use_container_width=True, key="tab2_primary_integral")
-        if is_optimal_n:
-            st.info(
-                f"多温度解析による最適反応次数: **n = {result.optimal_order_multi_temp:.3f}**  "
-                "(詳細は「Arrheniusパラメータ」タブを参照)"
-            )
+        result: AnalysisResult = st.session_state["analysis_results"]
+        fit = result.fit
 
-    st.markdown("---")
+        all_warnings = load_warnings + result.warnings
+        if all_warnings:
+            with st.expander("⚠️ 警告メッセージ", expanded=len(result.warnings) > 0):
+                for w in all_warnings:
+                    st.warning(w)
 
-    # ---- Method subtabs ----
-    subtab_titles = ["📐 積分法"]
-    if result.lsq is not None:
-        subtab_titles.append("📊 最小二乗法（解析解）")
-    if rk is not None:
-        subtab_titles.append("🔄 RK4法（ODE）")
+        st.subheader("解析結果 (RK4+最小二乗法)")
 
-    subtabs = st.tabs(subtab_titles)
-    subtab_idx = 0
+        def _show_fit_metrics(fit_i, df_i, key_prefix: str) -> None:
+            """Display metrics + fit/residual plots for a single FitResult."""
+            is_multi_i = fit_i.reaction_type in ("sequential", "parallel")
 
-    # Integral
-    with subtabs[subtab_idx]:
-        subtab_idx += 1
-        best       = result.best_result
-        best_order = result.best_order
-        st.caption("積分法は常に濃度A（成分A）のみを対象に解析します。")
-        cols = st.columns(3)
-        for idx, (order, res) in enumerate(result.integral.items()):
-            with cols[idx]:
-                is_best = order == best_order
-                prefix  = "★ " if is_best else ""
-                st.markdown(f"**{prefix}{ORDER_LABELS[order]}**")
-                st.metric("R²", f"{res.r2:.4f}")
-                st.metric("k",  f"{res.k:.5f}")
-                st.plotly_chart(plot_integral_fit(res), use_container_width=True, key=f"tab2_integral_fit_{order}")
-                st.plotly_chart(plot_residuals(res),    use_container_width=True, key=f"tab2_residuals_{order}")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("反応タイプ", REACTION_TYPE_LABELS.get(fit_i.reaction_type, fit_i.reaction_type))
+            k_str = f"{fit_i.k:.5f}" if np.isfinite(fit_i.k) else "N/A"
+            m2.metric("速度定数 k1", k_str)
+            r2_str = f"{fit_i.r2:.5f}" if np.isfinite(fit_i.r2) else "N/A"
+            m3.metric("R²", r2_str)
+            m4.metric("収束", "✅ 成功" if fit_i.success else "❌ 失敗")
 
-        st.subheader("モデル比較")
-        comp_df = pd.DataFrame([{
-            "反応次数": ORDER_LABELS[o],
-            "k":        round(r.k, 6),
-            "R²":       round(r.r2, 6),
-            "AIC":      round(r.aic, 4),
-            "推奨":     "★ 推奨" if o == best_order else "",
-        } for o, r in result.integral.items()])
-        st.dataframe(comp_df, use_container_width=True, hide_index=True)
+            ci1, ci2 = st.columns(2)
+            ci1.metric("k 95%CI 下限", f"{fit_i.k_ci_lower:.5f}" if np.isfinite(fit_i.k_ci_lower) else "N/A")
+            ci2.metric("k 95%CI 上限", f"{fit_i.k_ci_upper:.5f}" if np.isfinite(fit_i.k_ci_upper) else "N/A")
 
-    # LSQ (analytical solution)
-    if result.lsq is not None:
-        with subtabs[subtab_idx]:
-            subtab_idx += 1
-            lsq = result.lsq
-            st.caption("解析解（dC/dt = -k·Cⁿ の厳密解）を使った非線形最小二乗フィット。単純反応 A→products のみ。")
-            l1, l2, l3, l4 = st.columns(4)
-            l1.metric("推定次数 n",  f"{lsq.n:.4f}")
-            l2.metric("速度定数 k",  f"{lsq.k:.5f}")
-            l3.metric("R²",          f"{lsq.r2:.5f}")
-            l4.metric("RMSE",        f"{lsq.rmse:.5f}" if np.isfinite(lsq.rmse) else "N/A")
-            l5, l6 = st.columns(2)
-            l5.metric("初期濃度 C0 (フィット)", f"{lsq.C0:.5f}")
-            l6.metric("収束", "✅ 成功" if lsq.success else "❌ 失敗")
-            if not lsq.success:
-                st.warning(f"最適化メッセージ: {lsq.message}")
-            st.plotly_chart(plot_lsq_fit(df, lsq), use_container_width=True, key="tab2_lsq_detail")
-
-            if rk is not None and rk.reaction_type == "simple":
-                st.subheader("手法比較")
-                cmp_data = {
-                    "手法":   ["積分法 (best)", "最小二乗法（解析解）", "RK4法（ODE）"],
-                    "k":      [round(result.best_result.k, 6), round(lsq.k, 6), round(rk.k, 6)],
-                    "n/次数": [result.best_order, round(lsq.n, 4), round(rk.order, 4)],
-                    "R²":     [round(result.best_result.r2, 6), round(lsq.r2, 6), round(rk.r2, 6)],
-                }
-                st.dataframe(pd.DataFrame(cmp_data), use_container_width=True, hide_index=True)
-
-    # RK4 (ODE)
-    if rk is not None:
-        with subtabs[subtab_idx]:
-            rtype_label = REACTION_TYPE_LABELS.get(rk.reaction_type, rk.reaction_type)
-            st.caption("RK45 ODE ソルバーで反応速度式を数値積分し、最小二乗法でパラメータを最適化します。")
-            st.markdown(f"**反応タイプ:** {rtype_label}")
-
-            m1, m2, m3 = st.columns(3)
-            m1.metric("速度定数 k1", f"{rk.k:.5f}")
-            if rk.k2 is not None:
-                m2.metric("速度定数 k2", f"{rk.k2:.5f}")
+            if not is_multi_i:
+                st.metric("推定反応次数 n", f"{fit_i.order:.4f}" if np.isfinite(fit_i.order) else "N/A")
             else:
-                m2.metric("推定次数 n",  f"{rk.order:.4f}")
-            m3.metric("R²", f"{rk.r2:.5f}")
+                if fit_i.k2 is not None and np.isfinite(fit_i.k2):
+                    mk1, mk2, mk3, mk4 = st.columns(4)
+                    mk1.metric("速度定数 k2", f"{fit_i.k2:.5f}")
+                    mk2.metric("k2 95%CI 下限", f"{fit_i.k2_ci_lower:.5f}" if fit_i.k2_ci_lower is not None and np.isfinite(fit_i.k2_ci_lower) else "N/A")
+                    mk3.metric("k2 95%CI 上限", f"{fit_i.k2_ci_upper:.5f}" if fit_i.k2_ci_upper is not None and np.isfinite(fit_i.k2_ci_upper) else "N/A")
+                    rmse_val = f"{fit_i.rmse:.5f}" if np.isfinite(fit_i.rmse) else "N/A"
+                    mk4.metric("RMSE", rmse_val)
+                if fit_i.reaction_type == "sequential":
+                    nc1, nc2 = st.columns(2)
+                    nc1.metric("推定反応次数 n1 (A→B)", f"{fit_i.order:.4f}" if np.isfinite(fit_i.order) else "N/A")
+                    n2_val = fit_i.order2
+                    nc2.metric("推定反応次数 n2 (B→C)", f"{n2_val:.4f}" if n2_val is not None and np.isfinite(n2_val) else "N/A")
+                elif fit_i.reaction_type == "parallel":
+                    st.metric("推定反応次数 n", f"{fit_i.order:.4f}" if np.isfinite(fit_i.order) else "N/A")
 
-            m4, m5 = st.columns(2)
-            m4.metric("RMSE", f"{rk.rmse:.5f}" if np.isfinite(rk.rmse) else "N/A")
-            m5.metric("収束", "✅ 成功" if rk.success else "❌ 失敗")
+            if not fit_i.success:
+                st.warning(f"収束メッセージ: {fit_i.message}")
 
-            if not rk.success:
-                st.warning(f"最適化メッセージ: {rk.message}")
+            if len(fit_i.t_pred) > 0:
+                st.plotly_chart(plot_fit(df_i, fit_i), use_container_width=True, key=f"{key_prefix}_fit")
+                st.plotly_chart(plot_residuals_rk4(df_i, fit_i), use_container_width=True, key=f"{key_prefix}_residuals")
 
-            st.plotly_chart(plot_rk4lsq_fit(df, rk), use_container_width=True, key="tab2_rk4_detail")
-
-            if rk.reaction_type == "simple" and result.lsq is None:
-                st.subheader("積分法 vs RK4法 比較")
-                cmp_data = {
-                    "手法":   ["積分法 (best)", "RK4法（ODE）"],
-                    "k":      [round(result.best_result.k, 6), round(rk.k, 6)],
-                    "n/次数": [result.best_order, round(rk.order, 4)],
-                    "R²":     [round(result.best_result.r2, 6), round(rk.r2, 6)],
-                }
-                st.dataframe(pd.DataFrame(cmp_data), use_container_width=True, hide_index=True)
+        if result.is_multi_temp:
+            st.subheader("温度別解析結果")
+            tg = st.session_state.get("temp_groups", {})
+            for idx, (T_c, fit_i) in enumerate(result.per_temp_fits):
+                with st.expander(f"{T_c:.1f}°C の解析結果", expanded=False):
+                    df_i = tg.get(T_c, df)
+                    _show_fit_metrics(fit_i, df_i, key_prefix=f"tab2_temp_{idx}")
+            if result.optimal_order is not None:
+                st.info(
+                    f"温度別解析完了: Arrheniusパラメータは「Arrheniusパラメータ」タブを参照してください。"
+                    f"（R²加重平均 最適反応次数 n = {result.optimal_order:.4f}）"
+                )
+        else:
+            _show_fit_metrics(fit, df, key_prefix="tab2")
 
 
 # ===========================================================================
@@ -527,13 +413,12 @@ with tab3:
     if not has_multi_temp:
         st.info(
             "アレニウス解析には複数温度のデータが必要です。\n\n"
-            "**設定方法:** Excelファイルの `temperature` 列に各行の測定温度 (°C) を記入してください。"
-            "例: 25°Cと40°Cで測定した場合、それぞれの行に25.0または40.0と入力します。"
+            "**設定方法:** データファイルの `temperature` 列に各行の測定温度 (°C) を記入してください。"
         )
     elif not st.session_state["analysis_complete"]:
         st.info("サイドバーの「解析実行」ボタンを押してください。")
     else:
-        result: FullAnalysisResult = st.session_state["analysis_results"]
+        result: AnalysisResult = st.session_state["analysis_results"]
         arr    = result.arrhenius
         arr_k2 = result.arrhenius_k2
 
@@ -544,66 +429,56 @@ with tab3:
             )
         else:
             if arr is not None:
-                st.subheader(f"アレニウス解析結果 ({arr.k_label})")
+                st.subheader("アレニウス解析結果 (k1/k)")
                 a1, a2, a3 = st.columns(3)
-                a1.metric("活性化エネルギー Ea", f"{arr.Ea / 1000:.2f} kJ/mol")
+                a1.metric("活性化エネルギー Ea", f"{arr.Ea_kJmol:.2f} kJ/mol")
                 a2.metric("頻度因子 A",           f"{arr.A:.3e}")
                 a3.metric("R² (アレニウス)",       f"{arr.r2:.5f}")
-                a4, a5 = st.columns(2)
-                a4.metric("Ea 95%CI 下限 (kJ/mol)", f"{arr.Ea_ci_lower / 1000:.2f}")
-                a5.metric("Ea 95%CI 上限 (kJ/mol)", f"{arr.Ea_ci_upper / 1000:.2f}")
                 st.plotly_chart(plot_arrhenius(arr), use_container_width=True, key="tab3_arrhenius_k1")
 
                 st.subheader("温度別速度定数")
                 arr_tbl = pd.DataFrame({
-                    "温度 (°C)":  arr.temperatures_K - 273.15,
-                    "温度 (K)":   arr.temperatures_K,
-                    "1/T (K⁻¹)":  1.0 / arr.temperatures_K,
-                    f"{arr.k_label}": arr.k_values,
-                    f"ln({arr.k_label})": np.log(arr.k_values),
+                    "温度 (°C)":  arr.temps_celsius,
+                    "温度 (K)":   [t + 273.15 for t in arr.temps_celsius],
+                    "1/T (K⁻¹)":  arr.inv_T,
+                    "k":          arr.k_values,
+                    "ln(k)":      arr.ln_k,
                 })
                 st.dataframe(arr_tbl, use_container_width=True, hide_index=True)
 
             if arr_k2 is not None:
                 st.markdown("---")
-                st.subheader(f"アレニウス解析結果 ({arr_k2.k_label})")
+                st.subheader("アレニウス解析結果 (k2)")
                 b1, b2, b3 = st.columns(3)
-                b1.metric("活性化エネルギー Ea", f"{arr_k2.Ea / 1000:.2f} kJ/mol")
+                b1.metric("活性化エネルギー Ea", f"{arr_k2.Ea_kJmol:.2f} kJ/mol")
                 b2.metric("頻度因子 A",           f"{arr_k2.A:.3e}")
                 b3.metric("R² (アレニウス)",       f"{arr_k2.r2:.5f}")
                 st.plotly_chart(plot_arrhenius(arr_k2), use_container_width=True, key="tab3_arrhenius_k2")
 
-        if result.per_temp_results:
+        if result.per_temp_fits:
             st.markdown("---")
-            st.subheader("温度別反応次数推算")
+            st.subheader("温度別解析結果")
 
-            if result.optimal_order_multi_temp is not None:
+            if result.optimal_order is not None:
                 oc1, oc2 = st.columns(2)
-                oc1.metric("R²加重平均 反応次数 n", f"{result.optimal_order_multi_temp:.4f}")
-                n_ok = sum(1 for r in result.per_temp_results if r.success)
-                oc2.metric("解析成功温度数", f"{n_ok} / {len(result.per_temp_results)}")
+                oc1.metric("R²加重平均 反応次数 n", f"{result.optimal_order:.4f}")
+                n_ok = sum(1 for _, f in result.per_temp_fits if f.success)
+                oc2.metric("解析成功温度数", f"{n_ok} / {len(result.per_temp_fits)}")
 
-            if result.optimal_order_explanation:
-                with st.expander("推算詳細", expanded=False):
-                    st.text(result.optimal_order_explanation)
-
-            pt_rows = [
-                {
-                    "温度 (°C)": r.temperature_C,
-                    "推算次数 n": f"{r.n:.4f}" if r.success else "—",
-                    "速度定数 k": f"{r.k:.5f}" if r.success else "—",
-                    "R²": f"{r.r2:.4f}" if r.success else "—",
-                    "解法": r.method,
-                    "状態": "成功" if r.success else f"失敗: {r.message}",
+            pt_rows = []
+            for T_c, fit_i in result.per_temp_fits:
+                row_d: dict = {
+                    "温度 (°C)": T_c,
+                    "温度 (K)":  T_c + 273.15,
+                    "k":         f"{fit_i.k:.5f}" if np.isfinite(fit_i.k) else "—",
+                    "k 95%CI 下限": f"{fit_i.k_ci_lower:.5f}" if np.isfinite(fit_i.k_ci_lower) else "—",
+                    "k 95%CI 上限": f"{fit_i.k_ci_upper:.5f}" if np.isfinite(fit_i.k_ci_upper) else "—",
+                    "n":         f"{fit_i.order:.4f}" if np.isfinite(fit_i.order) else "—",
+                    "R²":        f"{fit_i.r2:.4f}"    if np.isfinite(fit_i.r2)    else "—",
+                    "収束":      "成功" if fit_i.success else "失敗",
                 }
-                for r in result.per_temp_results
-            ]
+                pt_rows.append(row_d)
             st.dataframe(pd.DataFrame(pt_rows), use_container_width=True, hide_index=True)
-
-            st.plotly_chart(
-                plot_order_per_temp(result.per_temp_results, result.optimal_order_multi_temp),
-                use_container_width=True, key="tab3_order_per_temp",
-            )
 
         st.subheader("温度別 濃度プロファイル")
         st.plotly_chart(plot_raw_multi_temp(temp_groups), use_container_width=True, key="tab3_multi_temp")
@@ -615,109 +490,214 @@ with tab3:
 with tab4:
     if not st.session_state["analysis_complete"]:
         st.info("先に解析を実行してください。")
-        st.stop()
+    else:
+        result: AnalysisResult = st.session_state["analysis_results"]
+        fit = result.fit
 
-    result: FullAnalysisResult = st.session_state["analysis_results"]
-    best       = result.best_result
-    best_order = result.best_order
+        st.subheader("解析結果サマリー")
 
-    st.subheader("解析結果サマリー")
-
-    # Auto-detected type info
-    st.markdown(
-        f"**自動判定:** {REACTION_TYPE_LABELS.get(result.detected_reaction_type, '')} — "
-        f"{result.detected_reaction_reason}"
-    )
-
-    st.markdown(
-        f"""
-| 項目 | 値 |
-|------|-----|
-| 推定反応次数 (積分法) | {ORDER_LABELS[best_order]} |
-| 速度定数 k | {best.k:.6f} min⁻¹ |
-| R² | {best.r2:.6f} |
-| k 95%CI | [{best.k_ci_lower:.6f}, {best.k_ci_upper:.6f}] |
-| AIC | {best.aic:.4f} |
-| データ点数 (A) | {best.n_points} |
-"""
-    )
-
-    if result.differential:
-        diff = result.differential
         st.markdown(
-            f"""
-**微分法結果**
-
-| 項目 | 値 |
-|------|-----|
-| 推定次数 n | {diff.n:.4f} |
-| 速度定数 k | {diff.k:.6f} |
-| R² (log-log) | {diff.r2:.4f} |
-"""
+            f"**自動判定:** {REACTION_TYPE_LABELS.get(result.detected_reaction_type, '')} — "
+            f"{result.detected_reaction_reason}"
         )
 
-    rk = result.rk4lsq
-    if rk is not None:
-        k2_row   = f"| 速度定数 k2 | {rk.k2:.6f} |\n" if rk.k2 is not None else ""
-        n_row    = f"| 推定次数 n | {rk.order:.4f} |\n" if rk.k2 is None else ""
-        rmse_str = f"{rk.rmse:.6f}" if np.isfinite(rk.rmse) else "N/A"
-        conv_str = "成功" if rk.success else "失敗"
+        def _fmt(v) -> str:
+            if v is None:
+                return "N/A"
+            try:
+                if not np.isfinite(float(v)):
+                    return "N/A"
+                return f"{float(v):.6f}"
+            except (TypeError, ValueError):
+                return str(v)
+
+        k2_row = f"| 速度定数 k2 | {_fmt(fit.k2)} |\n" if fit.k2 is not None else ""
+        n_row  = f"| 推定次数 n | {_fmt(fit.order)} |\n" if fit.reaction_type == "simple" else ""
+        conv_str = "成功" if fit.success else "失敗"
         st.markdown(
             f"""
-**RK4+最小二乗法結果** ({REACTION_TYPE_LABELS.get(rk.reaction_type, '')})
+**RK4+最小二乗法結果** ({REACTION_TYPE_LABELS.get(fit.reaction_type, '')})
 
 | 項目 | 値 |
 |------|-----|
-| 速度定数 k1 | {rk.k:.6f} |
-{k2_row}{n_row}| R² | {rk.r2:.6f} |
-| RMSE | {rmse_str} |
+| 速度定数 k1 | {_fmt(fit.k)} |
+{k2_row}{n_row}| k 95%CI 下限 | {_fmt(fit.k_ci_lower)} |
+| k 95%CI 上限 | {_fmt(fit.k_ci_upper)} |
+| R² | {_fmt(fit.r2)} |
+| RMSE | {_fmt(fit.rmse)} |
 | 収束 | {conv_str} |
 """
         )
 
-    for arr, title in [(result.arrhenius, "k1/k"), (result.arrhenius_k2, "k2")]:
-        if arr is None:
-            continue
-        st.markdown(
-            f"""
-**アレニウス解析 ({arr.k_label})**
+        for arr, title in [(result.arrhenius, "k1/k"), (result.arrhenius_k2, "k2")]:
+            if arr is None:
+                continue
+            st.markdown(
+                f"""
+**アレニウス解析 ({title})**
 
 | 項目 | 値 |
 |------|-----|
-| Ea (kJ/mol) | {arr.Ea / 1000:.3f} |
+| Ea (kJ/mol) | {arr.Ea_kJmol:.3f} |
 | 頻度因子 A | {arr.A:.4e} |
 | R² | {arr.r2:.6f} |
-| 温度点数 | {arr.n_temperatures} |
+| 温度点数 | {len(arr.temps_celsius)} |
 """
-        )
+            )
 
-    st.markdown("---")
-    st.subheader("ダウンロード")
+        st.markdown("---")
+        st.subheader("ダウンロード")
 
-    try:
-        excel_bytes = generate_excel_report(df, metadata, result)
-        st.download_button(
-            label="📥 Excelレポートをダウンロード",
-            data=excel_bytes,
-            file_name="kinetics_report.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    except Exception as e:
-        st.error(f"Excelレポート生成エラー: {e}")
+        try:
+            excel_bytes = generate_excel_report(df, result)
+            st.download_button(
+                label="📥 Excelレポートをダウンロード",
+                data=excel_bytes,
+                file_name="kinetics_report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception as e:
+            st.error(f"Excelレポート生成エラー: {e}")
 
-    try:
-        import plotly.io as pio
-        rk = result.rk4lsq
-        if rk is not None and rk.reaction_type in ("sequential", "parallel"):
-            fig_main = plot_rk4lsq_fit(df, rk)
-        else:
-            fig_main = plot_best_fit_conc(df, result)
-        png_bytes = pio.to_image(fig_main, format="png", width=900, height=500, scale=2)
-        st.download_button(
-            label="📸 主要グラフ (PNG) をダウンロード",
-            data=png_bytes,
-            file_name="main_plot.png",
-            mime="image/png",
-        )
-    except Exception:
-        st.info("PNG出力には kaleido パッケージが必要です (`pip install kaleido`)。")
+
+# ===========================================================================
+# Tab 5: Explanation — analysis logic and how to read results
+# ===========================================================================
+with tab5:
+    st.header("解析ロジック及び解析結果の読み取り方")
+
+    # -----------------------------------------------------------------------
+    # 1. 解析手法の概要
+    # -----------------------------------------------------------------------
+    st.subheader("1. 解析手法: RK4+最小二乗法（数値積分法）")
+    st.markdown(
+        """
+本アプリは **RK45 数値積分 + scipy.optimize.least_squares** の組み合わせで反応速度パラメータを推定します。
+
+**処理フロー**
+
+1. **ODE 数値積分 (RK45)** — 試行パラメータ $(k, n, C_0)$ を用いて反応の微分方程式を数値的に解き、濃度プロファイルを予測します。
+2. **残差計算** — 予測値と実測値の差（残差）を計算します。
+3. **最小二乗最適化** — 残差の二乗和を最小化するようにパラメータを更新します（Trust Region Reflective 法）。
+4. **マルチスタート** — 3 種類の異なる初期値から最適化を実行し、最もよい結果（最大 R²）を採用します。局所解への収束を抑制します。
+5. **信頼区間 (95%CI)** — 収束後のヤコビアン行列から共分散行列を計算し、95% 信頼区間を算出します。
+
+**各反応タイプの ODE 系**
+
+| 反応タイプ | 微分方程式 |
+|-----------|-----------|
+| 単純反応 A→P | $dA/dt = -k A^n$ |
+| 逐次反応 A→B→C | $dA/dt = -k_1 A^{n_1}$, $dB/dt = k_1 A^{n_1} - k_2 B^{n_2}$, $dC/dt = k_2 B^{n_2}$ |
+| 並列反応 A→B+A→C | $dA/dt = -(k_1+k_2) A^n$, $dB/dt = k_1 A^n$, $dC/dt = k_2 A^n$ |
+"""
+    )
+
+    # -----------------------------------------------------------------------
+    # 2. アレニウス解析
+    # -----------------------------------------------------------------------
+    st.subheader("2. アレニウス解析")
+    st.markdown(
+        r"""
+複数温度のデータがある場合、各温度で推定した速度定数 $k$ からアレニウス式をフィットします。
+
+$$
+k = A \exp\!\left(-\frac{E_a}{RT}\right)
+\quad\Longrightarrow\quad
+\ln k = \ln A - \frac{E_a}{R} \cdot \frac{1}{T}
+$$
+
+| 記号 | 説明 | 単位 |
+|------|------|------|
+| $E_a$ | 活性化エネルギー | kJ/mol |
+| $A$ | 頻度因子（前指数因子） | k と同じ単位 (min⁻¹ など) |
+| $R$ | 気体定数 = 8.314 | J/(mol·K) |
+| $T$ | 絶対温度 | K |
+
+**グラフの読み方**
+
+- **横軸 (1/T)** — 温度の逆数 (K⁻¹)。左ほど高温・右ほど低温。
+- **縦軸 (ln k)** — 速度定数の自然対数。高いほど反応が速い。
+- **回帰直線** — 傾きが $-E_a/R$。傾きが大きいほど温度依存性が強い（高 $E_a$）。
+
+**条件**: 各温度グループで 3 点以上の有効データと R² ≥ 0.5 の良好なフィットが必要です。
+条件を満たさない温度はアレニウスプロットから除外されます。
+"""
+    )
+
+    # -----------------------------------------------------------------------
+    # 3. 解析結果の読み取り方
+    # -----------------------------------------------------------------------
+    st.subheader("3. 解析結果の読み取り方")
+
+    st.markdown("#### 速度パラメータ")
+    st.markdown(
+        """
+| 指標 | 説明 | 目安 |
+|------|------|------|
+| **k (速度定数)** | 反応の速さを表す定数。大きいほど速い反応。 | 単位は min⁻¹（1次）や L/(mol·min)（2次）など |
+| **n (反応次数)** | 反応次数。整数に近い値が物理的に解釈しやすい。 | 0次=濃度に無関係、1次=比例、2次=二乗比例 |
+| **k2** | 逐次・並列反応の第2速度定数。 | k1 と k2 の比が選択性・収率に影響 |
+| **95%CI** | パラメータの 95% 信頼区間。 | 区間が狭いほど推定精度が高い |
+"""
+    )
+
+    st.markdown("#### フィット品質指標")
+    st.markdown(
+        """
+| 指標 | 説明 | 目安 |
+|------|------|------|
+| **R²** | 決定係数。1 に近いほど実測値と予測値が一致。 | ≥ 0.99: 優秀、≥ 0.95: 良好、< 0.90: 要確認 |
+| **RMSE** | 残差の二乗平均平方根（実測値との平均的なズレ）。 | 小さいほど良い。濃度スケールと同じ単位 |
+| **収束** | 最適化が正常に収束したかどうか。 | ❌ 失敗の場合は k・n の値の信頼性が低い |
+"""
+    )
+
+    st.markdown("#### アレニウスパラメータ")
+    st.markdown(
+        r"""
+| 指標 | 説明 | 目安 |
+|------|------|------|
+| **$E_a$ (活性化エネルギー)** | 反応の温度感受性の指標。 | 化学反応: 40〜150 kJ/mol が典型的 |
+| **頻度因子 $A$** | 分子衝突頻度に関係する定数。 | 温度 0 K での極限速度定数に相当（理論値） |
+| **R² (アレニウス)** | アレニウスプロットの直線性。 | ≥ 0.99 が良好。低い場合は複数反応機構の可能性 |
+"""
+    )
+
+    st.markdown("#### 残差プロットの見方")
+    st.markdown(
+        """
+残差プロット（観測値 − 予測値）は**系統的なパターンがないこと**が理想です。
+
+- **ランダムな分布** → フィットが適切（ODE モデルが実験をよく表現）
+- **U 字・逆 U 字のパターン** → モデルの反応次数が合っていない可能性
+- **特定時刻に大きな残差** → 外れ値・測定誤差、または反応機構の変化
+"""
+    )
+
+    # -----------------------------------------------------------------------
+    # 4. 注意事項・よくある質問
+    # -----------------------------------------------------------------------
+    st.subheader("4. 注意事項・トラブルシューティング")
+    st.markdown(
+        """
+**Q: 収束が失敗する**
+→ データ点数が少ない（推奨: 8 点以上）、または初期濃度付近のデータが不足しています。
+  時間 t=0 の測定値を含めることで安定します。
+
+**Q: R² が低い (<0.90)**
+→ 反応タイプの選択を確認してください。単純反応データに逐次反応モデルを適用すると R² が下がります。
+  複数のピーク・屈曲点がある場合は逐次反応モデルが適切な場合があります。
+
+**Q: アレニウスプロットに一部の温度が表示されない**
+→ 該当温度のフィットが失敗（収束エラー）か R² < 0.5 のため除外されています。
+  「解析結果」タブで各温度の解析状況を確認してください。
+
+**Q: 活性化エネルギーが負になる**
+→ 温度を上げると反応が遅くなるデータパターンです。拡散律速反応などで起こる場合があります。
+  データの信頼性（測定温度の誤りなど）を確認してください。
+
+**Q: 複数温度データの「全体フィット」結果は？**
+→ 「解析結果」タブに表示される結果は全温度のデータを結合した解析です。
+  温度別の速度定数は「Arrhenius パラメータ」タブの温度別テーブルを参照してください。
+"""
+    )

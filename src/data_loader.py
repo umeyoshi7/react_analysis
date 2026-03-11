@@ -1,4 +1,4 @@
-"""Excel data loading and validation for reaction kinetics analysis."""
+"""Excel/CSV data loading and validation for reaction kinetics analysis."""
 
 from __future__ import annotations
 
@@ -85,32 +85,58 @@ def _detect_columns(raw: pd.DataFrame) -> dict[str, str | None]:
 
 
 # ---------------------------------------------------------------------------
-# Main loader
+# Reaction type auto-detection
 # ---------------------------------------------------------------------------
 
-def load_experiment_data(
-    file: io.BytesIO,
-) -> tuple[pd.DataFrame, dict[str, Any], list[str]]:
+def auto_detect_reaction_type(df: pd.DataFrame) -> tuple[str, str]:
     """
-    Load experiment data from uploaded Excel file.
+    Suggest reaction type from data patterns.
 
     Returns
     -------
-    df : DataFrame with columns:
-         必須: [time, concentration, temperature, notes]
-         任意: [concentration_B, concentration_C]
-         ※ B/Cが全NaNの場合は列ごと除去される
-    metadata : dict from Sheet2 (実験条件)
-    warnings : list of Japanese warning messages
+    (suggested_type, reason_message)
+    suggested_type: "simple" | "sequential" | "parallel"
     """
-    warnings: list[str] = []
+    has_B = "concentration_B" in df.columns and df["concentration_B"].notna().any()
+    has_C = "concentration_C" in df.columns and df["concentration_C"].notna().any()
 
-    # --- Sheet1: 実験データ ---
-    try:
-        raw = pd.read_excel(file, sheet_name="実験データ", header=0)
-    except Exception as exc:
-        raise ValueError(f"Excelファイルの読み込みに失敗しました: {exc}") from exc
+    if not has_B:
+        return "simple", "濃度Bデータがないため単純反応 A→products として解析します。"
 
+    B_valid = df["concentration_B"].dropna().values
+    if len(B_valid) < 3:
+        return "sequential", "濃度Bのデータ点数が少ないため逐次反応を仮定します。"
+
+    # Check for peak in B (sequential indicator)
+    peak_idx = int(np.argmax(B_valid))
+    if 0 < peak_idx < len(B_valid) - 1:
+        return "sequential", (
+            f"濃度Bが時刻インデックス {peak_idx} でピークを持つため、"
+            "逐次反応 A→B→C を推奨します。"
+        )
+
+    # B monotonically increases -> parallel
+    if has_C:
+        return "parallel", (
+            "濃度Bが単調増加かつ濃度Cデータがあるため、"
+            "並列反応 A→B + A→C を推奨します。"
+        )
+
+    return "parallel", (
+        "濃度Bが単調増加するため並列反応 A→B + A→C を推奨します。"
+        "（濃度CがなければAのみの解析も可能です）"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Internal: build and validate DataFrame from raw
+# ---------------------------------------------------------------------------
+
+def _build_dataframe(
+    raw: pd.DataFrame,
+    warnings: list[str],
+) -> pd.DataFrame:
+    """Build, validate, and clean output DataFrame from raw data."""
     col_map = _detect_columns(raw)
 
     time_col = col_map["time"]
@@ -169,7 +195,6 @@ def load_experiment_data(
         df = df.sort_values("time").reset_index(drop=True)
 
     # 重複除去: 複数温度データでは (time, temperature) の組合せで判定
-    # 同一温度内で同じ時刻が重複している行のみを除去する
     temp_series_valid = df["temperature"].dropna()
     has_multi_temp = (temp_series_valid.nunique() > 1) if len(temp_series_valid) > 0 else False
     dup_cols = ["time", "temperature"] if has_multi_temp else ["time"]
@@ -193,7 +218,7 @@ def load_experiment_data(
     if df["concentration"].notna().sum() < 8:
         warnings.append(
             f"濃度Aのデータ点数が {df['concentration'].notna().sum()} 点です。"
-            "微分法の精度が低下する場合があります（推奨: 8点以上）。"
+            "解析の精度が低下する場合があります（推奨: 8点以上）。"
         )
 
     # ----------------------------------------------------------------
@@ -229,39 +254,77 @@ def load_experiment_data(
                 "ODE解析では各成分の測定時刻のみで残差を計算します。"
             )
 
-    # --- Sheet2: 実験条件 ---
-    metadata: dict[str, Any] = {}
-    try:
-        cond = pd.read_excel(file, sheet_name="実験条件", header=None)
-        label_map = {
-            "実験名": "experiment_name",
-            "反応物質": "substance",
-            "初期濃度": "initial_concentration",
-            "反応温度": "temperature",
-            "実験日": "experiment_date",
-            "担当者": "operator",
-            "備考": "notes",
-        }
-        for _, row in cond.iterrows():
-            label = str(row.iloc[0]).strip()
-            value = row.iloc[1] if len(row) > 1 else ""
-            key = label_map.get(label)
-            if key:
-                metadata[key] = value
-    except Exception:
-        warnings.append("実験条件シート(Sheet2)の読み込みに失敗しました。メタデータなしで続行します。")
+    return df
 
-    return df, metadata, warnings
+
+# ---------------------------------------------------------------------------
+# CSV loader
+# ---------------------------------------------------------------------------
+
+def load_csv_data(
+    file: io.BytesIO,
+) -> tuple[pd.DataFrame, dict, list[str]]:
+    """
+    Load experiment data from uploaded CSV file.
+
+    Expected CSV format (header row required):
+        time,concentration,concentration_B,concentration_C,temperature,notes
+
+    Returns
+    -------
+    df       : validated DataFrame
+    metadata : dict (empty)
+    warnings : list of Japanese warning messages
+    """
+    warnings: list[str] = []
+    try:
+        raw = pd.read_csv(file, header=0)
+    except Exception as exc:
+        raise ValueError(f"CSVファイルの読み込みに失敗しました: {exc}") from exc
+
+    df = _build_dataframe(raw, warnings)
+    return df, {}, warnings
+
+
+# ---------------------------------------------------------------------------
+# Main loader (auto-detect CSV vs Excel)
+# ---------------------------------------------------------------------------
+
+def load_experiment_data(
+    file: io.BytesIO,
+    filename: str = "",
+) -> tuple[pd.DataFrame, dict[str, Any], list[str]]:
+    """
+    Load experiment data from uploaded Excel or CSV file.
+
+    Auto-detects format from filename extension; defaults to Excel if unknown.
+
+    Returns
+    -------
+    df : DataFrame with columns:
+         必須: [time, concentration, temperature, notes]
+         任意: [concentration_B, concentration_C]
+         ※ B/Cが全NaNの場合は列ごと除去される
+    metadata : dict (空)
+    warnings : list of Japanese warning messages
+    """
+    if filename.lower().endswith(".csv"):
+        return load_csv_data(file)
+
+    # Default: Excel
+    warnings: list[str] = []
+    try:
+        raw = pd.read_excel(file, sheet_name="実験データ", header=0)
+    except Exception as exc:
+        raise ValueError(f"Excelファイルの読み込みに失敗しました: {exc}") from exc
+
+    df = _build_dataframe(raw, warnings)
+    return df, {}, warnings
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def get_positive_mask(df: pd.DataFrame) -> pd.Series:
-    """Return boolean mask where concentration_A > 0."""
-    return df["concentration"] > 0
-
 
 def check_mass_balance(
     df: pd.DataFrame,

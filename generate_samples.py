@@ -129,9 +129,13 @@ wb3.save('sample_data/sample3_parallel.xlsx')
 print('Sample 3: 並列反応 A→B + A→C (k1=0.03, k2=0.01) — 保存完了')
 
 # ==============================================================
-# Sample 4: 単純反応 複数温度 → Arrhenius (Ea=60kJ/mol)
+# Sample 4: 単純反応 複数温度 → Arrhenius (Ea=50kJ/mol, A=6e6)
+# 各温度での k 値:
+#   25°C: k≈0.0104 min⁻¹  35°C: k≈0.0201 min⁻¹
+#   45°C: k≈0.0372 min⁻¹  55°C: k≈0.0664 min⁻¹
+# → t=120min の最低濃度 ≈ 0.000348 (≠ 0) → 全温度でフィット可能
 # ==============================================================
-Ea, Af = 60000, 5e9
+Ea, Af = 50000, 6e6
 times4 = [0, 10, 20, 40, 60, 80, 100, 120]
 
 wb4 = openpyxl.Workbook()
@@ -144,9 +148,9 @@ for T_c in [25.0, 35.0, 45.0, 55.0]:
     for t, nt in zip(times4, note_list):
         all_rows4.append((t, round(math.exp(-kt * t), 6), T_c, nt))
 write_data_sheet(ws4, HDRS_A, all_rows4, WIDTHS_A)
-add_meta_sheet(wb4, '複数温度_Arrhenius_Ea=60kJ', '物質A', 1.0, '25-55°C', 'Ea=60kJ/mol, A=5e9')
+add_meta_sheet(wb4, '複数温度_Arrhenius_Ea=50kJ', '物質A', 1.0, '25-55°C', 'Ea=50kJ/mol, A=6e6')
 wb4.save('sample_data/sample4_multi_temp_arrhenius.xlsx')
-print('Sample 4: 複数温度 Arrhenius (25/35/45/55°C, Ea=60kJ/mol) — 保存完了')
+print('Sample 4: 複数温度 Arrhenius (25/35/45/55°C, Ea=50kJ/mol) — 保存完了')
 
 # ==============================================================
 # Sample 5: 異なる時間点 (A/B/Cが別タイミングで測定)
