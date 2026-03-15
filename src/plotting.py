@@ -236,6 +236,55 @@ def plot_arrhenius(result: ArrheniusResult) -> go.Figure:
 
 
 # ---------------------------------------------------------------------------
+# Simulation results overlay
+# ---------------------------------------------------------------------------
+
+DASH_STYLES = ["solid", "dash", "dot", "dashdot", "longdash"]
+
+
+def plot_simulation_results(sim_results, reaction_type: str) -> go.Figure:
+    """複数条件の濃度プロファイルを1図に重ね描き。
+    - 成分色: SPECIES_COLORS
+    - 線種: DASH_STYLES[condition_index % 5] で条件を区別
+    - トレース名: "[A] 条件1", "[B] 条件1", ...
+    """
+    fig = go.Figure()
+
+    species_order = ["A", "B", "C"]
+    if reaction_type == "simple":
+        species_order = ["A"]
+
+    for cond_idx, (cond, t_eval, c_dict) in enumerate(sim_results):
+        if t_eval is None or c_dict is None:
+            continue
+        dash = DASH_STYLES[cond_idx % len(DASH_STYLES)]
+        for sp in species_order:
+            if sp not in c_dict:
+                continue
+            color = SPECIES_COLORS[sp]
+            fig.add_trace(
+                go.Scatter(
+                    x=t_eval,
+                    y=c_dict[sp],
+                    mode="lines",
+                    line=dict(color=color, width=2, dash=dash),
+                    name=f"[{sp}] {cond.label}",
+                )
+            )
+
+    fig.update_layout(
+        title="シミュレーション結果",
+        xaxis_title="時間 (min)",
+        yaxis_title="濃度 (mol/L)",
+        template="plotly_white",
+        height=500,
+        legend=dict(x=1.01, y=1.0, xanchor="left"),
+        margin=dict(r=180),
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
 # Multi-temperature raw data overlay
 # ---------------------------------------------------------------------------
 

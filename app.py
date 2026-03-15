@@ -27,8 +27,15 @@ from src.plotting import (
     plot_raw,
     plot_raw_multi_temp,
     plot_residuals_rk4,
+    plot_simulation_results,
 )
 from src.reporter import generate_excel_report
+from src.simulation import (
+    SimulationCondition,
+    build_csv,
+    k_from_arrhenius,
+    run_all_simulations,
+)
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -76,6 +83,8 @@ def _init_state() -> None:
         "detected_reason":   "",
         "mass_balance_ok":   None,
         "mass_balance_cv":   None,
+        "sim_conditions":    [],
+        "sim_results":       None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -239,6 +248,8 @@ if run_btn and st.session_state["uploaded_df"] is not None:
             )
             st.session_state["analysis_results"]  = result
             st.session_state["analysis_complete"] = True
+            st.session_state["sim_results"]       = None
+            st.session_state["sim_conditions"]    = []
         except Exception as e:
             st.error(f"❌ 解析エラー: {e}")
 
@@ -271,9 +282,10 @@ temp_groups: dict   = st.session_state.get("temp_groups", {})
 has_multi_species   = "concentration_B" in df.columns
 has_multi_temp      = len(temp_groups) > 1
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["📊 データ確認", "🔬 解析結果", "🌡️ Arrheniusパラメータ", "📄 レポート出力", "📖 解析ロジック・結果の読み取り方"]
-)
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📊 データ確認", "🔬 解析結果", "🌡️ Arrheniusパラメータ",
+    "📄 レポート出力", "🧪 シミュレーション", "📖 解析ロジック・結果の読み取り方"
+])
 
 # ===========================================================================
 # Tab 1: Data overview
@@ -561,9 +573,188 @@ with tab4:
 
 
 # ===========================================================================
-# Tab 5: Explanation — analysis logic and how to read results
+# Tab 5: Simulation
 # ===========================================================================
 with tab5:
+    if not st.session_state["analysis_complete"]:
+        st.info("先にサイドバーの「解析実行」ボタンを押してください。解析結果が自動的にシミュレーション条件に反映されます。")
+    else:
+        result_sim: AnalysisResult = st.session_state["analysis_results"]
+        fit_sim = result_sim.fit
+        arr_sim = result_sim.arrhenius
+        arr_k2_sim = result_sim.arrhenius_k2
+        has_arrhenius = arr_sim is not None
+        rt_sim = fit_sim.reaction_type
+
+        # ── デフォルト条件の生成 ──────────────────────────────────────────────
+        if not st.session_state["sim_conditions"]:
+            k_default = fit_sim.k if np.isfinite(fit_sim.k) else 0.01
+            k2_default = fit_sim.k2 if (fit_sim.k2 is not None and np.isfinite(fit_sim.k2)) else None
+            n_default  = fit_sim.order if np.isfinite(fit_sim.order) else 1.0
+            n2_default = fit_sim.order2 if (fit_sim.order2 is not None and np.isfinite(fit_sim.order2)) else 1.0
+
+            default_cond: dict = {
+                "label":    "条件1",
+                "k":        k_default,
+                "k2":       k2_default,
+                "n":        n_default,
+                "n2":       n2_default,
+                "A0":       1.0,
+                "t_end":    60.0,
+                "T_celsius": arr_sim.temps_celsius[0] if has_arrhenius else None,
+                "use_arrhenius": has_arrhenius,
+            }
+
+            # k が NaN だった場合は警告
+            if not np.isfinite(fit_sim.k):
+                st.warning("解析結果の k が無効な値のため、k = 0.01 をデフォルト値に設定しました。")
+
+            st.session_state["sim_conditions"] = [default_cond]
+
+        sim_conds: list[dict] = st.session_state["sim_conditions"]
+
+        # ── 条件エディタ ────────────────────────────────────────────────────
+        st.subheader("シミュレーション条件")
+
+        for idx, cond_d in enumerate(sim_conds):
+            with st.expander(f"🔧 {cond_d['label']}", expanded=True):
+                col_lbl, col_del = st.columns([4, 1])
+                with col_lbl:
+                    new_label = st.text_input("条件ラベル", value=cond_d["label"],
+                                              key=f"sim_label_{idx}")
+                    sim_conds[idx]["label"] = new_label
+                with col_del:
+                    st.write("")
+                    st.write("")
+                    if st.button("🗑️ 削除", key=f"sim_del_{idx}",
+                                 disabled=(len(sim_conds) <= 1)):
+                        sim_conds.pop(idx)
+                        st.session_state["sim_conditions"] = sim_conds
+                        st.rerun()
+
+                # Arrhenius あり: 温度入力 → k 自動計算
+                if has_arrhenius:
+                    T_val = st.number_input(
+                        "温度 (°C)", value=float(cond_d.get("T_celsius") or 25.0),
+                        step=1.0, format="%.1f", key=f"sim_T_{idx}",
+                    )
+                    sim_conds[idx]["T_celsius"] = T_val
+                    try:
+                        k_calc = k_from_arrhenius(arr_sim, T_val)
+                        sim_conds[idx]["k"] = k_calc
+                        st.info(f"k(T) = {k_calc:.5g}  (Arrhenius: Ea={arr_sim.Ea_kJmol:.1f} kJ/mol, A={arr_sim.A:.3e})")
+                    except ValueError as e:
+                        st.error(f"k 計算エラー: {e}")
+
+                    if arr_k2_sim is not None:
+                        try:
+                            k2_calc = k_from_arrhenius(arr_k2_sim, T_val)
+                            sim_conds[idx]["k2"] = k2_calc
+                            st.info(f"k2(T) = {k2_calc:.5g}  (Arrhenius: Ea={arr_k2_sim.Ea_kJmol:.1f} kJ/mol)")
+                        except ValueError as e:
+                            st.error(f"k2 計算エラー: {e}")
+                else:
+                    # k を直接編集
+                    k_val = st.number_input(
+                        "速度定数 k", value=float(cond_d["k"]),
+                        min_value=0.0, step=0.001, format="%.5f", key=f"sim_k_{idx}",
+                    )
+                    sim_conds[idx]["k"] = k_val
+
+                # 反応次数 n
+                n_val = st.number_input(
+                    "反応次数 n", value=float(cond_d["n"]),
+                    min_value=0.0, max_value=5.0, step=0.1, format="%.2f", key=f"sim_n_{idx}",
+                )
+                sim_conds[idx]["n"] = n_val
+
+                # sequential / parallel の k2
+                if rt_sim in ("sequential", "parallel"):
+                    if not (has_arrhenius and arr_k2_sim is not None):
+                        k2_val = st.number_input(
+                            "速度定数 k2", value=float(cond_d["k2"] or 0.01),
+                            min_value=0.0, step=0.001, format="%.5f", key=f"sim_k2_{idx}",
+                        )
+                        sim_conds[idx]["k2"] = k2_val
+
+                    if rt_sim == "sequential":
+                        n2_val = st.number_input(
+                            "反応次数 n2 (B→C)", value=float(cond_d.get("n2") or 1.0),
+                            min_value=0.0, max_value=5.0, step=0.1, format="%.2f", key=f"sim_n2_{idx}",
+                        )
+                        sim_conds[idx]["n2"] = n2_val
+
+                # 初期濃度 / 終了時刻
+                col_A0, col_tend = st.columns(2)
+                with col_A0:
+                    A0_val = st.number_input(
+                        "[A]₀ (mol/L)", value=float(cond_d["A0"]),
+                        min_value=0.0, step=0.1, format="%.3f", key=f"sim_A0_{idx}",
+                    )
+                    sim_conds[idx]["A0"] = A0_val
+                with col_tend:
+                    tend_val = st.number_input(
+                        "終了時刻 t_end (min)", value=float(cond_d["t_end"]),
+                        min_value=0.1, step=10.0, format="%.1f", key=f"sim_tend_{idx}",
+                    )
+                    sim_conds[idx]["t_end"] = tend_val
+
+        st.session_state["sim_conditions"] = sim_conds
+
+        # ── 条件追加ボタン ──────────────────────────────────────────────────
+        if st.button("➕ 条件を追加"):
+            last = dict(sim_conds[-1])
+            last["label"] = f"条件{len(sim_conds) + 1}"
+            sim_conds.append(last)
+            st.session_state["sim_conditions"] = sim_conds
+            st.rerun()
+
+        st.markdown("---")
+
+        # ── 実行ボタン ──────────────────────────────────────────────────────
+        if st.button("▶ シミュレーション実行", type="primary"):
+            conditions_objs = []
+            for cond_d in sim_conds:
+                conditions_objs.append(SimulationCondition(
+                    label=cond_d["label"],
+                    reaction_type=rt_sim,
+                    k=cond_d["k"],
+                    n=cond_d["n"],
+                    k2=cond_d.get("k2"),
+                    n2=cond_d.get("n2"),
+                    A0=cond_d["A0"],
+                    t_end=cond_d["t_end"],
+                ))
+            with st.spinner("シミュレーション中…"):
+                st.session_state["sim_results"] = run_all_simulations(conditions_objs)
+
+        # ── 結果表示 ────────────────────────────────────────────────────────
+        sim_results = st.session_state.get("sim_results")
+        if sim_results is not None:
+            failed = [cond.label for cond, t, c in sim_results if t is None]
+            if failed:
+                st.warning(f"以下の条件で ODE 求解に失敗しました: {', '.join(failed)}")
+
+            success_results = [(cond, t, c) for cond, t, c in sim_results if t is not None]
+            if not success_results:
+                st.error("すべての条件でシミュレーションに失敗しました。パラメータを確認してください。")
+            else:
+                fig_sim = plot_simulation_results(sim_results, rt_sim)
+                st.plotly_chart(fig_sim, use_container_width=True, key="tab5_sim")
+
+                csv_str = build_csv(sim_results)
+                st.download_button(
+                    label="📥 CSV ダウンロード",
+                    data=csv_str.encode("utf-8-sig"),
+                    file_name="simulation_results.csv",
+                    mime="text/csv",
+                )
+
+
+# ===========================================================================
+# Tab 6: Explanation — analysis logic and how to read results
+# ===========================================================================
+with tab6:
     st.header("解析ロジック及び解析結果の読み取り方")
 
     # -----------------------------------------------------------------------
@@ -675,9 +866,58 @@ $$
     )
 
     # -----------------------------------------------------------------------
-    # 4. 注意事項・よくある質問
+    # 4. 反応シミュレーション
     # -----------------------------------------------------------------------
-    st.subheader("4. 注意事項・トラブルシューティング")
+    st.subheader("4. 反応シミュレーション")
+    st.markdown(
+        r"""
+「🧪 シミュレーション」タブでは、解析で得られたパラメータを用いて任意の条件下での濃度プロファイルを予測します。
+
+**処理フロー**
+
+1. **速度定数の決定** — アレニウスパラメータが得られている場合（複数温度データ）と、そうでない場合とで異なります（下表）。
+2. **ODE 求解** — 決定した $k$, $n$, $[A]_0$ を ODE に代入し、RK45 で数値積分します。
+3. **濃度プロファイル出力** — 時刻 $0$ から $t_\text{end}$ までの $[A]$（逐次・並列反応では $[B]$, $[C]$ も）を計算して描画します。
+
+**速度定数 $k$ の決定方法**
+
+| データ条件 | k の決定方法 |
+|-----------|------------|
+| 複数温度データあり（Arrhenius 解析成立） | $k(T) = A \exp\!\left(-\dfrac{E_a}{RT}\right)$ でユーザー指定温度から自動計算 |
+| 一点温度のみ（Arrhenius 解析なし） | その温度でフィットした $k$ を初期値として手動入力 |
+
+> **注意**: 一点温度の場合は $E_a$ と $A$ を一意に決定できないため、他の温度への外挿は行いません。
+> 他の温度での $k$ を推定するには、文献値などから $E_a$ を別途入力してください。
+
+**ODE 系（シミュレーション・フィッティングで共通）**
+
+| 反応タイプ | 微分方程式 |
+|-----------|-----------|
+| 単純反応 A→P | $\dfrac{d[A]}{dt} = -k[A]^n$ |
+| 逐次反応 A→B→C | $\dfrac{d[A]}{dt} = -k_1[A]^{n_1}$、$\dfrac{d[B]}{dt} = k_1[A]^{n_1} - k_2[B]^{n_2}$、$\dfrac{d[C]}{dt} = k_2[B]^{n_2}$ |
+| 並列反応 A→B+A→C | $\dfrac{d[A]}{dt} = -(k_1+k_2)[A]^n$、$\dfrac{d[B]}{dt} = k_1[A]^n$、$\dfrac{d[C]}{dt} = k_2[A]^n$ |
+
+**数値積分の設定**
+
+| 設定項目 | 値 |
+|---------|----|
+| ソルバー | `scipy.integrate.solve_ivp`（`RK45` 法） |
+| 相対許容誤差 `rtol` | $10^{-6}$ |
+| 絶対許容誤差 `atol` | $10^{-9}$ |
+| 出力点数 | 500点（$t=0$ から $t_\text{end}$ を等間隔） |
+| 負値処理 | 各成分は $\max(\text{計算値},\, 0)$ でクリップ |
+
+**複数条件の比較**
+
+「条件を追加」ボタンで複数の条件を同時にシミュレートし、1つのグラフ上で重ね描きできます。
+結果は CSV ダウンロードも可能です（列: `condition_label`, `time`, `A`, `B`, `C`）。
+"""
+    )
+
+    # -----------------------------------------------------------------------
+    # 5. 注意事項・よくある質問
+    # -----------------------------------------------------------------------
+    st.subheader("5. 注意事項・トラブルシューティング")
     st.markdown(
         """
 **Q: 収束が失敗する**
