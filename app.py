@@ -13,6 +13,11 @@ import pandas as pd
 import streamlit as st
 
 from src.analysis import run_analysis
+from src.thermochemistry import (
+    COMMON_MOLECULES,
+    calc_reaction_heat,
+    validate_smiles,
+)
 from src.data_loader import (
     auto_detect_reaction_type,
     check_mass_balance,
@@ -85,6 +90,9 @@ def _init_state() -> None:
         "mass_balance_cv":   None,
         "sim_conditions":    [],
         "sim_results":       None,
+        "thermo_reactants":  [{"smiles": "", "coeff": 1.0, "use_manual": False, "manual_hf": 0.0}],
+        "thermo_products":   [{"smiles": "", "coeff": 1.0, "use_manual": False, "manual_hf": 0.0}],
+        "thermo_result":     None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -282,9 +290,10 @@ temp_groups: dict   = st.session_state.get("temp_groups", {})
 has_multi_species   = "concentration_B" in df.columns
 has_multi_temp      = len(temp_groups) > 1
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📊 データ確認", "🔬 解析結果", "🌡️ Arrheniusパラメータ",
-    "📄 レポート出力", "🧪 シミュレーション", "📖 解析ロジック・結果の読み取り方"
+    "📄 レポート出力", "🧪 シミュレーション", "📖 解析ロジック・結果の読み取り方",
+    "🔥 反応熱推算",
 ])
 
 # ===========================================================================
@@ -941,3 +950,244 @@ $$
   温度別の速度定数は「Arrhenius パラメータ」タブの温度別テーブルを参照してください。
 """
     )
+
+
+# ===========================================================================
+# Tab 7: 反応熱推算
+# ===========================================================================
+with tab7:
+    st.header("🔥 反応熱推算")
+    st.markdown(
+        """
+        SMILES を入力すると **Joback 基団寄与法** で標準生成エンタルピー ΔHf° を推算し、
+        反応熱 ΔH_rxn を計算します。H₂O・CO₂・O₂ などの一般的な無機分子は文献値を使用します。
+        推算できない分子は手動で ΔHf° を入力してください。
+        精度目安: Joback 法 ±10〜20%（有機分子）。
+        """
+    )
+
+    # ── よく使う SMILES 一覧 ──────────────────────────────────────────────
+    with st.expander("📋 よく使う SMILES 一覧"):
+        ref_rows = [
+            {"化学式": f, "SMILES": s, "化合物名": n}
+            for f, s, n in COMMON_MOLECULES
+        ]
+        st.dataframe(
+            pd.DataFrame(ref_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("---")
+
+    # ── 行エディタ ヘルパー ──────────────────────────────────────────────
+    def _render_compound_rows(
+        rows: list[dict],
+        role: str,
+        key_prefix: str,
+    ) -> None:
+        """反応物 or 生成物の入力行をレンダリングし、rows を in-place で更新する."""
+        header_cols = st.columns([3.5, 1.2, 1.8, 2.0, 0.7])
+        header_cols[0].caption("SMILES")
+        header_cols[1].caption("係数")
+        header_cols[2].caption("化学式")
+        header_cols[3].caption("ΔHf° 手動入力 (kJ/mol)")
+        header_cols[4].caption("削除")
+
+        for idx, row in enumerate(rows):
+            c1, c2, c3, c4, c5 = st.columns([3.5, 1.2, 1.8, 2.0, 0.7])
+
+            with c1:
+                smiles_val = st.text_input(
+                    "SMILES",
+                    value=row["smiles"],
+                    key=f"{key_prefix}_smiles_{idx}",
+                    placeholder="例: CCO",
+                    label_visibility="collapsed",
+                )
+                rows[idx]["smiles"] = smiles_val
+
+            with c2:
+                coeff_val = st.number_input(
+                    "係数",
+                    value=float(row["coeff"]),
+                    min_value=0.01,
+                    step=0.5,
+                    format="%.2f",
+                    key=f"{key_prefix}_coeff_{idx}",
+                    label_visibility="collapsed",
+                )
+                rows[idx]["coeff"] = coeff_val
+
+            with c3:
+                if smiles_val:
+                    valid, _, formula = validate_smiles(smiles_val)
+                    if valid:
+                        st.markdown(f"**{formula}**")
+                    else:
+                        st.error("無効", icon="✗")
+                else:
+                    st.caption("—")
+
+            with c4:
+                use_manual = st.checkbox(
+                    "手動入力",
+                    value=bool(row["use_manual"]),
+                    key=f"{key_prefix}_useman_{idx}",
+                    label_visibility="collapsed",
+                )
+                rows[idx]["use_manual"] = use_manual
+                if use_manual:
+                    manual_val = st.number_input(
+                        "ΔHf°",
+                        value=float(row["manual_hf"]),
+                        step=10.0,
+                        format="%.2f",
+                        key=f"{key_prefix}_mhf_{idx}",
+                        label_visibility="collapsed",
+                    )
+                    rows[idx]["manual_hf"] = manual_val
+                else:
+                    st.caption("自動推算")
+
+            with c5:
+                st.write("")
+                if st.button(
+                    "✕",
+                    key=f"{key_prefix}_del_{idx}",
+                    disabled=(len(rows) <= 1),
+                    use_container_width=True,
+                ):
+                    rows.pop(idx)
+                    st.session_state[f"thermo_{role}"] = rows
+                    st.rerun()
+
+    # ── 反応物 ──────────────────────────────────────────────────────────
+    st.subheader("反応物")
+    thermo_r: list[dict] = st.session_state["thermo_reactants"]
+    _render_compound_rows(thermo_r, "reactants", "thr")
+    st.session_state["thermo_reactants"] = thermo_r
+    if st.button("➕ 反応物を追加", key="thermo_add_r"):
+        thermo_r.append({"smiles": "", "coeff": 1.0, "use_manual": False, "manual_hf": 0.0})
+        st.session_state["thermo_reactants"] = thermo_r
+        st.rerun()
+
+    st.markdown("---")
+
+    # ── 生成物 ──────────────────────────────────────────────────────────
+    st.subheader("生成物")
+    thermo_p: list[dict] = st.session_state["thermo_products"]
+    _render_compound_rows(thermo_p, "products", "thp")
+    st.session_state["thermo_products"] = thermo_p
+    if st.button("➕ 生成物を追加", key="thermo_add_p"):
+        thermo_p.append({"smiles": "", "coeff": 1.0, "use_manual": False, "manual_hf": 0.0})
+        st.session_state["thermo_products"] = thermo_p
+        st.rerun()
+
+    st.markdown("---")
+
+    # ── 計算ボタン ───────────────────────────────────────────────────────
+    col_calc, col_clear = st.columns([3, 1])
+    with col_calc:
+        calc_btn = st.button(
+            "🔥 反応熱を計算",
+            type="primary",
+            use_container_width=True,
+            disabled=(
+                not any(r["smiles"].strip() for r in thermo_r) or
+                not any(p["smiles"].strip() for p in thermo_p)
+            ),
+        )
+    with col_clear:
+        if st.button("🗑️ リセット", use_container_width=True):
+            st.session_state["thermo_reactants"] = [
+                {"smiles": "", "coeff": 1.0, "use_manual": False, "manual_hf": 0.0}
+            ]
+            st.session_state["thermo_products"] = [
+                {"smiles": "", "coeff": 1.0, "use_manual": False, "manual_hf": 0.0}
+            ]
+            st.session_state["thermo_result"] = None
+            st.rerun()
+
+    if calc_btn:
+        reactants_in = [
+            (r["coeff"], r["smiles"], r["manual_hf"] if r["use_manual"] else None)
+            for r in thermo_r if r["smiles"].strip()
+        ]
+        products_in = [
+            (p["coeff"], p["smiles"], p["manual_hf"] if p["use_manual"] else None)
+            for p in thermo_p if p["smiles"].strip()
+        ]
+        with st.spinner("計算中…"):
+            st.session_state["thermo_result"] = calc_reaction_heat(reactants_in, products_in)
+
+    # ── 結果表示 ─────────────────────────────────────────────────────────
+    thermo_result = st.session_state.get("thermo_result")
+    if thermo_result is not None:
+        st.markdown("---")
+        st.subheader("計算結果")
+
+        if thermo_result.warnings:
+            for w in thermo_result.warnings:
+                st.warning(w)
+
+        if thermo_result.success and thermo_result.delta_H_kJ_mol is not None:
+            dH = thermo_result.delta_H_kJ_mol
+            if dH < 0:
+                reaction_type_str = "発熱反応 (exothermic)"
+                color = "#d62728"
+            elif dH > 0:
+                reaction_type_str = "吸熱反応 (endothermic)"
+                color = "#1f77b4"
+            else:
+                reaction_type_str = "熱中性"
+                color = "#555555"
+
+            st.markdown(
+                f"<h2 style='color:{color};'>ΔH_rxn = {dH:+.2f} kJ/mol</h2>"
+                f"<p style='color:{color};font-size:1.1em;'>{reaction_type_str}</p>",
+                unsafe_allow_html=True,
+            )
+
+            # 明細テーブル
+            rows_data = []
+            for coeff, cr in thermo_result.reactant_results:
+                contribution = -coeff * cr.hf_kJ_mol
+                rows_data.append({
+                    "区分":            "反応物",
+                    "化学式":          cr.formula,
+                    "SMILES":          cr.canonical_smiles,
+                    "係数 ν":          f"−{coeff:.2f}",
+                    "ΔHf° (kJ/mol)":  f"{cr.hf_kJ_mol:.2f}",
+                    "寄与 (kJ/mol)":  f"{contribution:+.2f}",
+                    "計算手法":        cr.method + (f" [{cr.known_name}]" if cr.known_name else ""),
+                })
+            for coeff, cr in thermo_result.product_results:
+                contribution = coeff * cr.hf_kJ_mol
+                rows_data.append({
+                    "区分":            "生成物",
+                    "化学式":          cr.formula,
+                    "SMILES":          cr.canonical_smiles,
+                    "係数 ν":          f"+{coeff:.2f}",
+                    "ΔHf° (kJ/mol)":  f"{cr.hf_kJ_mol:.2f}",
+                    "寄与 (kJ/mol)":  f"{contribution:+.2f}",
+                    "計算手法":        cr.method + (f" [{cr.known_name}]" if cr.known_name else ""),
+                })
+            st.dataframe(
+                pd.DataFrame(rows_data),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.markdown(
+                r"""
+**計算式:** ΔH_rxn = Σ(ν_生成物 × ΔHf°_生成物) − Σ(ν_反応物 × ΔHf°_反応物)
+
+**精度目安:**
+- 文献値: 高精度
+- Joback法: ±10〜20 kJ/mol 程度（有機分子）
+- 無機物・小分子で Joback 法が失敗する場合は手動入力をご利用ください
+"""
+            )
+        else:
+            st.error("一部の化合物で ΔHf° を取得できませんでした。上記の警告を確認して手動入力してください。")

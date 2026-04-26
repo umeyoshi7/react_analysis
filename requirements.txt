@@ -5,3 +5,6 @@ scipy==1.17.1
 plotly==6.6.0
 openpyxl==3.1.5
 xlsxwriter==3.2.9
+rdkit==2026.3.1
+thermo==0.6.0
+ugropy==3.1.6
