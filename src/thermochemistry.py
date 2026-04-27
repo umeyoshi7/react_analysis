@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import math
 from dataclasses import dataclass, field
 
 from rdkit import Chem, RDLogger
@@ -550,4 +551,166 @@ def calc_reaction_heat(
         product_results=product_results,
         warnings=warnings_all,
         success=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# プロセス安全評価（MTSR / TD24 / Stoessel 5段階リスク評価）
+# ---------------------------------------------------------------------------
+
+_STOESSEL_CLASS_INFO: dict[int, dict] = {
+    1: {
+        "label": "クラス 1 — 非常に低リスク",
+        "color": "#2ca02c",
+        "description": "MTSR < MTT。冷却失敗で到達する最高温度が沸点以下であり、二次分解の懸念なし。",
+        "action": "通常の操作手順で安全に実施可能。",
+    },
+    2: {
+        "label": "クラス 2 — 低リスク",
+        "color": "#98df8a",
+        "description": "MTT < MTSR かつ TD24 > MTSR。沸点は超えるが、24 h 自己加速分解温度には届かない。",
+        "action": "沸点超過に対する対策（還流設備・ベント設計）を検討。",
+    },
+    3: {
+        "label": "クラス 3 — 中リスク",
+        "color": "#ff7f0e",
+        "description": "MTT < TD24 < MTSR。MTSR に至る過程で TD24 を超え、二次分解が誘発される可能性がある。",
+        "action": "冷却失敗シナリオの DIERS 解析と緊急冷却設備の検討が必要。",
+    },
+    4: {
+        "label": "クラス 4 — 高リスク",
+        "color": "#d62728",
+        "description": "TD24 ≤ MTT < MTSR。沸点以下でも 24 h 以内に自己加速分解が起きる温度域。",
+        "action": "プロセスの抜本的見直し。断熱条件での安全性試験（ARC/DSC）が必須。",
+    },
+    5: {
+        "label": "クラス 5 — 非常に高リスク",
+        "color": "#7b241c",
+        "description": "TD24 ≤ Tp。通常のプロセス温度がすでに自己加速分解温度以上。即座に危険な状態。",
+        "action": "直ちに操業停止を検討。プロセス全体の再設計が必要。",
+    },
+}
+
+
+@dataclass
+class ProcessSafetyResult:
+    tp_C: float
+    delta_tad_K: float
+    mtsr_C: float
+    td24_C: float | None
+    td24_method: str
+    mtt_C: float
+    stoessel_class: int
+    stoessel_label: str
+    stoessel_color: str
+    stoessel_description: str
+    stoessel_action: str
+
+
+def calc_td24_simple(tonset_C: float) -> float:
+    """TD24 を DSC 開始温度から簡易推算する（経験則: Tonset − 100 °C）."""
+    return tonset_C - 100.0
+
+
+def _tmr_seconds(
+    T_K: float,
+    ea_J_mol: float,
+    A_1_s: float,
+    qd_J_kg: float,
+    cp_J_kgK: float,
+) -> float:
+    """断熱誘導期間 TMR (s) を Arrhenius モデルで計算する.
+
+    TMR_ad = Cp * R * T² / (Qd * A * exp(-Ea/RT) * Ea)
+    """
+    R = 8.314
+    exponent = -ea_J_mol / (R * T_K)
+    if exponent < -700:
+        return float("inf")
+    k = A_1_s * math.exp(exponent)
+    if k <= 0 or qd_J_kg <= 0 or ea_J_mol <= 0:
+        return float("inf")
+    return (cp_J_kgK * R * T_K**2) / (qd_J_kg * k * ea_J_mol)
+
+
+def calc_td24_arrhenius(
+    ea_kJ_mol: float,
+    A_1_s: float,
+    qd_kJ_kg: float,
+    cp_J_gK: float,
+    t_search_range_C: tuple[float, float] = (-50.0, 500.0),
+) -> float | None:
+    """TD24 を Arrhenius 動力学パラメータから二分法で計算する（TMR = 24 h の温度）."""
+    TARGET_S = 86400.0
+    ea_J = ea_kJ_mol * 1000.0
+    qd_J_kg = qd_kJ_kg * 1000.0
+    cp_J_kgK = cp_J_gK * 1000.0
+
+    T_lo = t_search_range_C[0] + 273.15
+    T_hi = t_search_range_C[1] + 273.15
+
+    try:
+        tmr_lo = _tmr_seconds(T_lo, ea_J, A_1_s, qd_J_kg, cp_J_kgK)
+        tmr_hi = _tmr_seconds(T_hi, ea_J, A_1_s, qd_J_kg, cp_J_kgK)
+    except Exception:
+        return None
+
+    if tmr_hi > TARGET_S or tmr_lo < TARGET_S:
+        return None
+
+    for _ in range(80):
+        T_mid = (T_lo + T_hi) / 2.0
+        tmr_mid = _tmr_seconds(T_mid, ea_J, A_1_s, qd_J_kg, cp_J_kgK)
+        if tmr_mid > TARGET_S:
+            T_lo = T_mid
+        else:
+            T_hi = T_mid
+        if T_hi - T_lo < 0.005:
+            break
+
+    return (T_lo + T_hi) / 2.0 - 273.15
+
+
+def assess_process_safety(
+    tp_C: float,
+    delta_tad_K: float,
+    mtt_C: float,
+    td24_C: float | None,
+    td24_method: str = "なし",
+) -> ProcessSafetyResult:
+    """MTSR と Stoessel 5段階リスク評価を実施する.
+
+    温度の大小関係:
+        Class 1: MTSR ≤ MTT
+        Class 2: MTSR > MTT かつ TD24 > MTSR (または TD24 未入力)
+        Class 3: MTSR > MTT かつ MTT < TD24 ≤ MTSR
+        Class 4: MTSR > MTT かつ TD24 ≤ MTT
+        Class 5: TD24 ≤ Tp (最優先判定)
+    """
+    mtsr_C = tp_C + delta_tad_K
+
+    if td24_C is not None and td24_C <= tp_C:
+        cls = 5
+    elif mtsr_C <= mtt_C:
+        cls = 1
+    elif td24_C is None or td24_C > mtsr_C:
+        cls = 2
+    elif td24_C > mtt_C:
+        cls = 3
+    else:
+        cls = 4
+
+    info = _STOESSEL_CLASS_INFO[cls]
+    return ProcessSafetyResult(
+        tp_C=tp_C,
+        delta_tad_K=delta_tad_K,
+        mtsr_C=mtsr_C,
+        td24_C=td24_C,
+        td24_method=td24_method,
+        mtt_C=mtt_C,
+        stoessel_class=cls,
+        stoessel_label=info["label"],
+        stoessel_color=info["color"],
+        stoessel_description=info["description"],
+        stoessel_action=info["action"],
     )

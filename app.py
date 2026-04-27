@@ -8,7 +8,10 @@ from src.thermochemistry import (
     COMMON_MOLECULES,
     REACTION_TEMPLATES,
     SOLVENT_DATA,
+    assess_process_safety,
     calc_reaction_heat,
+    calc_td24_arrhenius,
+    calc_td24_simple,
     get_mol_svg,
     svg_to_data_uri,
     validate_smiles,
@@ -236,6 +239,55 @@ def _build_scheme_html(
     )
 
 
+def _make_stoessel_diagram(safety) -> go.Figure:
+    """Stoessel 温度スケール図（横軸: 温度、主要指標をマーカーで表示）を生成する."""
+    points: list[tuple[str, float, str, str]] = [
+        ("Tp", safety.tp_C, "#1f77b4", "circle"),
+        ("MTT (沸点)", safety.mtt_C, "#ff7f0e", "diamond"),
+        ("MTSR", safety.mtsr_C, "#d62728", "star"),
+    ]
+    if safety.td24_C is not None:
+        points.append(("TD24", safety.td24_C, "#9467bd", "triangle-up"))
+
+    points_sorted = sorted(points, key=lambda x: x[1])
+
+    fig = go.Figure()
+
+    all_temps = [p[1] for p in points]
+    t_min, t_max = min(all_temps), max(all_temps)
+    margin = max((t_max - t_min) * 0.25, 20.0)
+    x_range = [t_min - margin, t_max + margin]
+
+    fig.add_shape(
+        type="line",
+        x0=x_range[0], x1=x_range[1], y0=0, y1=0,
+        line=dict(color="#cccccc", width=2),
+    )
+
+    for name, temp, color, symbol in points_sorted:
+        fig.add_trace(go.Scatter(
+            x=[temp], y=[0],
+            mode="markers+text",
+            marker=dict(size=18, color=color, symbol=symbol,
+                        line=dict(color="white", width=1)),
+            text=[f"<b>{name}</b><br>{temp:.1f} °C"],
+            textposition="top center",
+            name=name,
+            showlegend=True,
+        ))
+
+    fig.update_layout(
+        xaxis=dict(title="温度 (°C)", range=x_range, zeroline=False),
+        yaxis=dict(visible=False, range=[-0.5, 1.2]),
+        height=220,
+        margin=dict(l=20, r=20, t=10, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.5, xanchor="center", x=0.5),
+        plot_bgcolor="#fafafa",
+        paper_bgcolor="white",
+    )
+    return fig
+
+
 def _make_energy_diagram(
     delta_H: float,
     delta_H_gas: float | None,
@@ -386,9 +438,10 @@ with col_calc:
     )
 with col_clear:
     if st.button("リセット", use_container_width=True):
-        st.session_state["reactants"] = [{"smiles": "", "coeff": 1.0, "use_manual": False, "manual_hf": 0.0}]
-        st.session_state["products"]  = [{"smiles": "", "coeff": 1.0, "use_manual": False, "manual_hf": 0.0}]
-        st.session_state["result"]    = None
+        st.session_state["reactants"]     = [{"smiles": "", "coeff": 1.0, "use_manual": False, "manual_hf": 0.0}]
+        st.session_state["products"]      = [{"smiles": "", "coeff": 1.0, "use_manual": False, "manual_hf": 0.0}]
+        st.session_state["result"]        = None
+        st.session_state["safety_result"] = None
         st.rerun()
 
 if calc_btn:
@@ -483,6 +536,155 @@ if result is not None:
         )
     else:
         st.error("一部の化合物で ΔHf° を取得できませんでした。上記の警告を確認して手動入力してください。")
+
+# ── プロセス安全評価 ─────────────────────────────────────────────────────────
+if result is not None and result.success and result.delta_H_kJ_mol is not None:
+    st.markdown("---")
+    st.subheader("プロセス安全評価（MTSR / TD24 / Stoessel リスク評価）")
+
+    with st.expander("入力パラメータを設定する", expanded=True):
+        ps_col1, ps_col2 = st.columns(2)
+
+        with ps_col1:
+            st.markdown("**反応条件**")
+            ps_tp = st.number_input(
+                "プロセス温度 Tp (°C)",
+                value=float(round(temperature_K - 273.15, 1)),
+                min_value=-100.0, max_value=500.0, step=5.0, format="%.1f",
+                help="通常の運転温度。反応条件で設定した温度が初期値。",
+            )
+            ps_mtt = st.number_input(
+                "MTT — 沸点または最大技術温度 (°C)",
+                value=100.0,
+                min_value=-100.0, max_value=500.0, step=5.0, format="%.1f",
+                help="冷却失敗シナリオで超えてはならない上限温度（沸点・リリーフ設定温度など）。",
+            )
+
+            st.markdown("**断熱温度上昇 ΔTad**")
+            tad_method = st.radio(
+                "計算方法",
+                ["直接入力", "Cp × 質量から計算"],
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+            if tad_method == "直接入力":
+                ps_dtad = st.number_input(
+                    "ΔTad (K)",
+                    value=50.0, min_value=0.0, max_value=2000.0, step=5.0, format="%.1f",
+                    help="冷却完全失敗時の断熱温度上昇。実測値（ARC/DSC）を推奨。",
+                )
+            else:
+                ps_cp = st.number_input(
+                    "反応混合物の比熱 Cp [J/(g·K)]",
+                    value=2.0, min_value=0.1, max_value=10.0, step=0.1, format="%.2f",
+                    help="反応液全体の比熱容量（水≈4.18、有機溶媒≈1.5〜2.0 J/(g·K)）。",
+                )
+                ps_mass = st.number_input(
+                    "1 mol 反応あたりの混合物質量 [g/mol]",
+                    value=100.0, min_value=1.0, max_value=100000.0, step=10.0, format="%.1f",
+                    help="反応スケールあたりの溶液総質量。",
+                )
+                dH_abs = abs(result.delta_H_kJ_mol)
+                ps_dtad = dH_abs * 1000.0 / (ps_cp * ps_mass)
+                st.caption(f"ΔTad = {dH_abs:.2f} kJ/mol × 1000 / ({ps_cp} × {ps_mass:.0f}) = **{ps_dtad:.1f} K**")
+
+        with ps_col2:
+            st.markdown("**TD24 の推算**")
+            td24_method_sel = st.radio(
+                "TD24 計算方法",
+                ["入力しない（未知）", "簡易推算（Tonset − 100 °C）", "Arrhenius パラメータから計算"],
+                label_visibility="collapsed",
+            )
+
+            td24_C_val: float | None = None
+            td24_method_label = "なし"
+
+            if td24_method_sel == "簡易推算（Tonset − 100 °C）":
+                tonset = st.number_input(
+                    "DSC 分解開始温度 Tonset (°C)",
+                    value=200.0, min_value=0.0, max_value=600.0, step=5.0, format="%.1f",
+                    help="DSC で観測される発熱ピーク開始温度。",
+                )
+                td24_C_val = calc_td24_simple(tonset)
+                td24_method_label = "簡易推算"
+                st.caption(f"TD24 = {tonset:.1f} − 100 = **{td24_C_val:.1f} °C**（経験則）")
+
+            elif td24_method_sel == "Arrhenius パラメータから計算":
+                arr_ea = st.number_input(
+                    "活性化エネルギー Ea (kJ/mol)",
+                    value=100.0, min_value=10.0, max_value=500.0, step=5.0, format="%.1f",
+                    help="分解反応の活性化エネルギー（DSC/ARC 速度解析から取得）。",
+                )
+                arr_A = st.number_input(
+                    "頻度因子 A (1/s) — 対数入力",
+                    value=13.0, min_value=1.0, max_value=30.0, step=0.5, format="%.1f",
+                    help="log₁₀(A) を入力（例: 13 → A = 10¹³ s⁻¹）。",
+                )
+                arr_qd = st.number_input(
+                    "分解熱 Qd (kJ/kg)",
+                    value=500.0, min_value=10.0, max_value=10000.0, step=50.0, format="%.1f",
+                    help="単位質量あたりの分解エンタルピー（DSC 測定値）。",
+                )
+                arr_cp = st.number_input(
+                    "比熱 Cp [J/(g·K)]（分解計算用）",
+                    value=2.0, min_value=0.1, max_value=10.0, step=0.1, format="%.2f",
+                )
+                A_actual = 10.0 ** arr_A
+                td24_C_val = calc_td24_arrhenius(arr_ea, A_actual, arr_qd, arr_cp)
+                td24_method_label = "Arrhenius"
+                if td24_C_val is not None:
+                    st.caption(f"TD24 = **{td24_C_val:.1f} °C**（TMR = 24 h）")
+                else:
+                    st.warning("指定パラメータの探索範囲（−50〜500 °C）で TD24 が見つかりませんでした。Ea / A / Qd を確認してください。")
+
+        ps_run = st.button("安全評価を実行", type="primary", use_container_width=True)
+
+    if ps_run or "safety_result" in st.session_state:
+        if ps_run:
+            st.session_state["safety_result"] = assess_process_safety(
+                tp_C=ps_tp,
+                delta_tad_K=ps_dtad,
+                mtt_C=ps_mtt,
+                td24_C=td24_C_val,
+                td24_method=td24_method_label,
+            )
+
+        sr = st.session_state.get("safety_result")
+        if sr is not None:
+            st.markdown("#### 評価結果")
+
+            # Stoessel クラス バナー
+            st.markdown(
+                f"<div style='background:{sr.stoessel_color};color:white;"
+                f"padding:14px 20px;border-radius:8px;font-size:1.25em;font-weight:bold;'>"
+                f"{sr.stoessel_label}</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(f"**{sr.stoessel_description}**")
+            st.info(f"推奨アクション: {sr.stoessel_action}")
+
+            # 主要温度の指標
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Tp (プロセス温度)", f"{sr.tp_C:.1f} °C")
+            m2.metric("MTSR", f"{sr.mtsr_C:.1f} °C", delta=f"ΔTad = +{sr.delta_tad_K:.1f} K")
+            m3.metric("MTT (沸点)", f"{sr.mtt_C:.1f} °C")
+            td24_display = f"{sr.td24_C:.1f} °C" if sr.td24_C is not None else "未入力"
+            m4.metric(f"TD24 ({sr.td24_method})", td24_display)
+
+            # 温度スケール図
+            st.plotly_chart(_make_stoessel_diagram(sr), use_container_width=True)
+
+            # 判定ロジック説明テーブル
+            with st.expander("Stoessel 5段階の判定基準"):
+                import pandas as pd
+                cls_df = pd.DataFrame([
+                    {"クラス": "1", "条件": "MTSR ≤ MTT", "リスク": "非常に低い"},
+                    {"クラス": "2", "条件": "MTSR > MTT、TD24 > MTSR（または未入力）", "リスク": "低い"},
+                    {"クラス": "3", "条件": "MTSR > MTT、MTT < TD24 ≤ MTSR", "リスク": "中程度"},
+                    {"クラス": "4", "条件": "MTSR > MTT、TD24 ≤ MTT", "リスク": "高い"},
+                    {"クラス": "5", "条件": "TD24 ≤ Tp", "リスク": "非常に高い"},
+                ])
+                st.dataframe(cls_df, use_container_width=True, hide_index=True)
 
 # ── 解析ロジック説明 ─────────────────────────────────────────────────────────
 st.markdown("---")
