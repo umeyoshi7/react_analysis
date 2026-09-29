@@ -59,7 +59,7 @@ with st.sidebar:
     if selected_template != "(なし — 手動入力)":
         tmpl = REACTION_TEMPLATES[selected_template]
         st.caption(f"**{tmpl['type']}** — {tmpl['description']}")
-        if st.button("テンプレートを適用", use_container_width=True, type="primary"):
+        if st.button("テンプレートを適用", width="stretch", type="primary"):
             import copy
             st.session_state["reactants"] = copy.deepcopy(tmpl["reactants"])
             st.session_state["products"]  = copy.deepcopy(tmpl["products"])
@@ -74,7 +74,7 @@ with st.sidebar:
         ref_df = pd.DataFrame(
             [{"化合物名": n, "化学式": f, "SMILES": s} for f, s, n in COMMON_MOLECULES]
         )
-        st.dataframe(ref_df, use_container_width=True, hide_index=True)
+        st.dataframe(ref_df, width="stretch", hide_index=True)
 
     st.markdown("---")
     st.caption(
@@ -88,22 +88,6 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _render_molecule_svg(smiles: str, width: int = 180, height: int = 130) -> None:
-    """SMILES を 2D 構造式として表示する."""
-    if not smiles.strip():
-        st.caption("—")
-        return
-    svg = get_mol_svg(smiles, width=width, height=height)
-    if svg is None:
-        st.error("無効な SMILES")
-        return
-    uri = svg_to_data_uri(svg)
-    st.markdown(
-        f'<img src="{uri}" width="{width}" style="border:1px solid #ddd;border-radius:4px;"/>',
-        unsafe_allow_html=True,
-    )
-
 
 def _render_compound_rows(rows: list[dict], role: str, key_prefix: str) -> None:
     """反応物 / 生成物の入力行を描画し、rows を in-place で更新する."""
@@ -173,7 +157,7 @@ def _render_compound_rows(rows: list[dict], role: str, key_prefix: str) -> None:
         with c5:
             st.write("")
             if st.button("x", key=f"{key_prefix}_del_{idx}",
-                         disabled=(len(rows) <= 1), use_container_width=True):
+                         disabled=(len(rows) <= 1), width="stretch"):
                 rows.pop(idx)
                 st.session_state[f"{role}"] = rows
                 st.rerun()
@@ -343,7 +327,7 @@ def _make_energy_diagram(
 # ---------------------------------------------------------------------------
 
 st.title("反応熱推算アプリ")
-st.caption("SMILES 入力 → 反応スキーム可視化 → ΔH_rxn 推算 (Joback 基団寄与法 / 文献値)")
+st.caption("SMILES 入力 → 反応スキーム可視化 → ΔH_rxn 推算 (文献値 / Gani 法 / Joback 基団寄与法)")
 
 # ── 入力セクション ──────────────────────────────────────────────────────────
 col_r, col_p = st.columns(2)
@@ -434,10 +418,10 @@ with col_calc:
         or not any(p["smiles"].strip() for p in thermo_p)
     )
     calc_btn = st.button(
-        "反応熱を計算", type="primary", use_container_width=True, disabled=calc_disabled
+        "反応熱を計算", type="primary", width="stretch", disabled=calc_disabled
     )
 with col_clear:
-    if st.button("リセット", use_container_width=True):
+    if st.button("リセット", width="stretch"):
         st.session_state["reactants"]     = [{"smiles": "", "coeff": 1.0, "use_manual": False, "manual_hf": 0.0}]
         st.session_state["products"]      = [{"smiles": "", "coeff": 1.0, "use_manual": False, "manual_hf": 0.0}]
         st.session_state["result"]        = None
@@ -477,7 +461,9 @@ if result is not None:
         rxn_label = "発熱反応 (exothermic)" if dH < 0 else ("吸熱反応 (endothermic)" if dH > 0 else "熱中性")
 
         st.markdown(
-            f"<h2 style='color:{color};'>ΔH_rxn = {dH:+.2f} kJ/mol</h2>"
+            f"<h2 style='color:{color};'>ΔH_rxn = {dH:+.2f}"
+            + (f" ± {result.uncertainty_kJ:.0f}" if result.uncertainty_kJ else "")
+            + " kJ/mol</h2>"
             f"<p style='color:{color};font-size:1.1em;'>{rxn_label}"
             f" @ {result.temperature_K - 273.15:.1f} °C"
             + (f"  |  溶媒: {solvent_name}" if solvent_name != "なし (気相・標準状態)" else "")
@@ -500,7 +486,7 @@ if result is not None:
             result.kirchhoff_correction_kJ,
             result.solvent_correction_kJ,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         # 明細テーブル
         import pandas as pd
@@ -525,13 +511,13 @@ if result is not None:
                 "寄与 (kJ/mol)": f"{coeff * cr.hf_kJ_mol:+.2f}",
                 "計算手法": cr.method + (f" [{cr.known_name}]" if cr.known_name else ""),
             })
-        st.dataframe(pd.DataFrame(rows_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows_data), width="stretch", hide_index=True)
 
         st.markdown(
             r"""
 **計算式:** ΔH_rxn = Σ(ν_生成物 × ΔHf°_生成物) − Σ(ν_反応物 × ΔHf°_反応物)
 
-**精度目安:** 文献値: 高精度 | Joback 法: ±10〜20 kJ/mol（有機分子）
+**精度目安:** 文献値: ±1 | Gani 法: ±10 | Joback 法: ±25 kJ/mol（有機分子, 概算）
 """
         )
     else:
@@ -637,7 +623,7 @@ if result is not None and result.success and result.delta_H_kJ_mol is not None:
                 else:
                     st.warning("指定パラメータの探索範囲（−50〜500 °C）で TD24 が見つかりませんでした。Ea / A / Qd を確認してください。")
 
-        ps_run = st.button("安全評価を実行", type="primary", use_container_width=True)
+        ps_run = st.button("安全評価を実行", type="primary", width="stretch")
 
     if ps_run or "safety_result" in st.session_state:
         if ps_run:
@@ -672,7 +658,7 @@ if result is not None and result.success and result.delta_H_kJ_mol is not None:
             m4.metric(f"TD24 ({sr.td24_method})", td24_display)
 
             # 温度スケール図
-            st.plotly_chart(_make_stoessel_diagram(sr), use_container_width=True)
+            st.plotly_chart(_make_stoessel_diagram(sr), width="stretch")
 
             # 判定ロジック説明テーブル
             with st.expander("Stoessel 5段階の判定基準"):
@@ -684,7 +670,7 @@ if result is not None and result.success and result.delta_H_kJ_mol is not None:
                     {"クラス": "4", "条件": "MTSR > MTT、TD24 ≤ MTT", "リスク": "高い"},
                     {"クラス": "5", "条件": "TD24 ≤ Tp", "リスク": "非常に高い"},
                 ])
-                st.dataframe(cls_df, use_container_width=True, hide_index=True)
+                st.dataframe(cls_df, width="stretch", hide_index=True)
 
 # ── 解析ロジック説明 ─────────────────────────────────────────────────────────
 st.markdown("---")
@@ -699,7 +685,8 @@ with st.expander("解析ロジック・計算手法の説明"):
 |--------|------|------|
 | 1 | 手動入力 | ユーザーが指定した値をそのまま使用 |
 | 2 | 文献値 | 主要無機物・小分子の NIST 値 |
-| 3 | Joback 基団寄与法 | ugropy ライブラリで官能基を分解・積算 |
+| 3 | Gani 基団寄与法 | ugropy ライブラリ (環・近接効果を考慮) |
+| 4 | Joback 基団寄与法 | ugropy ライブラリで官能基を分解・積算 |
 
 **2. 反応熱の計算式**
 
@@ -722,7 +709,8 @@ $\Delta H_{solv}$ はユーザー手動入力（溶媒和エンタルピーは�
 | 手法 | 精度 |
 |------|------|
 | 文献値 | < ±1 kJ/mol |
-| Joback 法 | ±10〜20 kJ/mol（有機分子） |
+| Gani 法 | ±10 kJ/mol（有機分子） |
+| Joback 法 | ±25 kJ/mol（有機分子） |
 | Kirchhoff 補正（定数 $C_p$）| ±5〜20 kJ/mol（±100 K 以内） |
 """
     )

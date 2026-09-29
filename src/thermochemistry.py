@@ -1,12 +1,14 @@
-"""反応熱推算モジュール (Joback基団寄与法 + 文献値フォールバック)"""
+"""反応熱推算モジュール (文献値 → Gani法 → Joback法 のフォールバック)"""
 from __future__ import annotations
 
 import base64
+import csv
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from rdkit import Chem, RDLogger
-from rdkit.Chem import AllChem, rdMolDescriptors
+from rdkit.Chem import AllChem, inchi, rdMolDescriptors
 from rdkit.Chem.Draw import rdMolDraw2D
 
 RDLogger.DisableLog("rdApp.*")
@@ -42,10 +44,78 @@ _KNOWN_HF: dict[str, tuple[float, str]] = {
     "BrBr":           (30.91,    "Br₂(g)"),
     "FF":             (0.0,      "F₂(g)"),
     "CC=O":           (-166.19,  "CH₃CHO(g)"),
+    "CO":             (-200.66,  "CH₃OH(g)"),
+    "CCO":            (-234.8,   "C₂H₅OH(g)"),
+    "c1ccccc1":       (82.9,     "ベンゼン(g)"),
+    "CC(=O)O":        (-432.2,   "CH₃COOH(g)"),
+    "CC(C)=O":        (-217.1,   "アセトン(g)"),
+    "Cc1ccccc1":      (50.4,     "トルエン(g)"),
+    "C1CC1":          (53.3,     "シクロプロパン(g)"),
+    "ClC(Cl)Cl":      (-102.7,   "CHCl₃(g)"),
+    "O=C1C=CC(=O)O1": (-398.3,   "無水マレイン酸(g)"),
 }
 
+# ---------------------------------------------------------------------------
+# CSV 文献値 DB (data/hf_gas.csv, InChIKey 照合)
+# ---------------------------------------------------------------------------
+_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "hf_gas.csv"
+
+
+def _load_hf_db() -> tuple[dict[str, tuple[float, str, float]], dict[str, list[str]]]:
+    """(InChIKey → (ΔHf, 名称, 不確かさ), 接続層(先頭14文字) → InChIKey 一覧) を返す."""
+    full: dict[str, tuple[float, str, float]] = {}
+    by_skeleton: dict[str, list[str]] = {}
+    try:
+        with _DB_PATH.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                key = row["inchikey"].strip()
+                full[key] = (
+                    float(row["hf_kJ_mol"]),
+                    row["name"].strip(),
+                    float(row.get("uncertainty_kJ") or 1.0),
+                )
+                by_skeleton.setdefault(key[:14], []).append(key)
+    except (OSError, ValueError, KeyError):
+        pass  # DB が無くても Gani/Joback で動作する
+    return full, by_skeleton
+
+
+_HF_DB, _HF_DB_SKELETON = _load_hf_db()
+
+
+def _lookup_hf_db(canon: str) -> tuple[float, str, float, bool] | None:
+    """InChIKey で DB を引く. (ΔHf, 名称, 不確かさ, 立体異性体まで一致か)."""
+    mol = Chem.MolFromSmiles(canon)
+    if mol is None:
+        return None
+    try:
+        key = inchi.MolToInchiKey(mol)
+    except Exception:
+        return None
+    if not key:
+        return None
+    if key in _HF_DB:
+        hf, name, unc = _HF_DB[key]
+        return hf, name, unc, True
+    # 立体情報だけが違う場合は、接続層が一意に一致するときのみ採用
+    cands = _HF_DB_SKELETON.get(key[:14], [])
+    if len(cands) == 1:
+        hf, name, unc = _HF_DB[cands[0]]
+        return hf, name, unc, False
+    return None
+
+
+# 推算法ごとの不確かさ目安 (kJ/mol, 1σ 相当の概算)
+METHOD_UNCERTAINTY: dict[str, float] = {
+    "手動入力": 0.0,
+    "文献値": 1.0,
+    "Gani法": 10.0,
+    "Joback法": 25.0,
+}
+_SMALL_RING_MAX = 4  # 環ひずみ補正のない基団寄与法が苦手な環サイズ
+
 # 定圧熱容量 Cp (J/mol/K, 理想気体 ~298 K, 定数近似)
-# キーは RDKit 正規化 SMILES (モジュール末尾の _build_cp_table で正規化済み)
+# キーは任意の SMILES でよい (_build_cp_table が RDKit 正規化 SMILES に変換する)
 _CP_RAW: dict[str, float] = {
     "O":          33.59,   # H2O(g)
     "O=C=O":      37.11,   # CO2(g)
@@ -306,6 +376,8 @@ class CompoundResult:
     method: str
     known_name: str = ""
     error: str = ""
+    uncertainty_kJ: float | None = None
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -319,6 +391,7 @@ class ReactionHeatResult:
     product_results: list[tuple[float, CompoundResult]]
     warnings: list[str]
     success: bool
+    uncertainty_kJ: float | None = None  # ΔH_rxn の不確かさ (二乗和平方根)
 
 
 # ---------------------------------------------------------------------------
@@ -330,9 +403,10 @@ def get_hf(smiles: str, manual_hf: float | None = None) -> CompoundResult:
 
     優先順位:
         1. manual_hf が指定されている場合
-        2. 文献値ルックアップ
-        3. Joback 基団寄与法 (ugropy)
-        4. 失敗
+        2. 文献値ルックアップ (組込み表 → data/hf_gas.csv を InChIKey で照合)
+        3. Gani 法 (ugropy, 環・近接効果を扱える)
+        4. Joback 基団寄与法 (ugropy)
+        5. 失敗
     """
     valid, canon, formula = validate_smiles(smiles)
     if not valid:
@@ -352,9 +426,10 @@ def get_hf(smiles: str, manual_hf: float | None = None) -> CompoundResult:
             formula=formula,
             hf_kJ_mol=manual_hf,
             method="手動入力",
+            uncertainty_kJ=METHOD_UNCERTAINTY["手動入力"],
         )
 
-    if canon in _KNOWN_HF:
+    if manual_hf is None and canon in _KNOWN_HF:
         hf, name = _KNOWN_HF[canon]
         return CompoundResult(
             smiles_input=smiles,
@@ -363,22 +438,43 @@ def get_hf(smiles: str, manual_hf: float | None = None) -> CompoundResult:
             hf_kJ_mol=hf,
             method="文献値",
             known_name=name,
+            uncertainty_kJ=METHOD_UNCERTAINTY["文献値"],
         )
 
-    try:
-        from ugropy import joback
-        result = joback.get_groups(smiles, identifier_type="smiles")
-        hf_q = result.ig_enthalpy_formation
-        if hf_q is not None:
+    if manual_hf is None:
+        hit = _lookup_hf_db(canon)
+        if hit is not None:
+            hf, name, unc, exact = hit
             return CompoundResult(
                 smiles_input=smiles,
                 canonical_smiles=canon,
                 formula=formula,
-                hf_kJ_mol=float(hf_q.magnitude),
-                method="Joback法",
+                hf_kJ_mol=hf,
+                method="文献値",
+                known_name=f"{name}(g)",
+                uncertainty_kJ=unc,
+                warnings=[] if exact else [
+                    f"{formula}: 立体異性体が DB と異なるため {name} の値を流用しています。"
+                ],
             )
-    except Exception:
-        pass
+
+    ring_warns = _small_ring_warnings(canon, formula)
+
+    for method, estimator in (("Gani法", _estimate_gani), ("Joback法", _estimate_joback)):
+        try:
+            hf = estimator(smiles)
+        except Exception:
+            hf = None
+        if hf is not None:
+            return CompoundResult(
+                smiles_input=smiles,
+                canonical_smiles=canon,
+                formula=formula,
+                hf_kJ_mol=hf,
+                method=method,
+                uncertainty_kJ=METHOD_UNCERTAINTY[method],
+                warnings=ring_warns,
+            )
 
     return CompoundResult(
         smiles_input=smiles,
@@ -387,10 +483,36 @@ def get_hf(smiles: str, manual_hf: float | None = None) -> CompoundResult:
         hf_kJ_mol=None,
         method="推算失敗",
         error=(
-            "Joback 法でグループ分解に失敗しました。"
+            "Gani 法・Joback 法ともにグループ分解に失敗しました。"
             "手動で ΔHf° を入力してください。"
         ),
     )
+
+
+def _estimate_gani(smiles: str) -> float | None:
+    from ugropy import Groups
+    q = Groups(smiles, "smiles").agani.ig_formation_enthalpy
+    return float(q.magnitude) if q is not None else None
+
+
+def _estimate_joback(smiles: str) -> float | None:
+    from ugropy import joback
+    q = joback.get_groups(smiles, identifier_type="smiles").ig_enthalpy_formation
+    return float(q.magnitude) if q is not None else None
+
+
+def _small_ring_warnings(canon: str, formula: str) -> list[str]:
+    mol = Chem.MolFromSmiles(canon)
+    if mol is None:
+        return []
+    sizes = {len(r) for r in mol.GetRingInfo().AtomRings()}
+    small = sorted(n for n in sizes if n <= _SMALL_RING_MAX)
+    if not small:
+        return []
+    return [
+        f"{formula}: {'・'.join(str(n) for n in small)}員環を含みます。基団寄与法は環ひずみを"
+        "十分に考慮できず、数十 kJ/mol ずれる場合があります。文献値の手動入力を推奨します。"
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -409,19 +531,11 @@ def get_cp_estimate(smiles: str) -> tuple[float | None, str]:
     try:
         from ugropy import joback
         result = joback.get_groups(smiles, identifier_type="smiles")
-        # ugropy が Cp 係数を提供している場合 (a + b*T + c*T² + d*T³)
-        for a_attr in ("ig_heat_capacity_a", "heat_capacity_a", "Cp_a"):
-            if hasattr(result, a_attr) and getattr(result, a_attr) is not None:
-                a = float(getattr(result, a_attr))
-                def _get(attr: str) -> float:
-                    v = getattr(result, attr, None)
-                    return float(v) if v is not None else 0.0
-                b = _get(a_attr.replace("_a", "_b"))
-                c = _get(a_attr.replace("_a", "_c"))
-                d = _get(a_attr.replace("_a", "_d"))
-                T = 298.15
-                cp = a + b * T + c * T**2 + d * T**3
-                return cp, "Joback法 (298 K)"
+        params = result.heat_capacity_ideal_gas_params  # a + bT + cT² + dT³
+        if params is not None and len(params) == 4:
+            a_, b_, c_, d_ = (float(x) for x in params)
+            T = 298.15
+            return a_ + b_ * T + c_ * T**2 + d_ * T**3, "Joback法 (298 K)"
     except Exception:
         pass
 
@@ -528,6 +642,22 @@ def calc_reaction_heat(
             success=False,
         )
 
+    for _, r in reactant_results + product_results:
+        warnings_all.extend(r.warnings)
+
+    methods = {r.method for _, r in reactant_results + product_results} - {"手動入力"}
+    estimated = methods - {"文献値"}
+    if estimated and len(methods) > 1:
+        warnings_all.append(
+            "推算手法が混在しています (" + "・".join(sorted(methods)) + ")。"
+            "手法ごとの系統誤差が打ち消されないため、ΔH_rxn の誤差が大きくなる可能性があります。"
+        )
+
+    unc = math.sqrt(sum(
+        (c * (r.uncertainty_kJ or 0.0)) ** 2
+        for c, r in reactant_results + product_results
+    ))
+
     delta_H_gas = (
         sum(c * r.hf_kJ_mol for c, r in product_results)
         - sum(c * r.hf_kJ_mol for c, r in reactant_results)
@@ -551,6 +681,7 @@ def calc_reaction_heat(
         product_results=product_results,
         warnings=warnings_all,
         success=True,
+        uncertainty_kJ=unc,
     )
 
 
