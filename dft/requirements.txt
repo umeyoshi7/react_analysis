@@ -1,0 +1,9 @@
+pyscf>=2.6
+pyscf-dispersion
+tblite
+ase
+rdkit
+numpy
+pyyaml
+google-cloud-storage
+google-cloud-aiplatform

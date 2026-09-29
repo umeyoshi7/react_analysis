@@ -61,9 +61,9 @@ _KNOWN_HF: dict[str, tuple[float, str]] = {
 _DB_PATH = Path(__file__).resolve().parent.parent / "data" / "hf_gas.csv"
 
 
-def _load_hf_db() -> tuple[dict[str, tuple[float, str, float]], dict[str, list[str]]]:
-    """(InChIKey → (ΔHf, 名称, 不確かさ), 接続層(先頭14文字) → InChIKey 一覧) を返す."""
-    full: dict[str, tuple[float, str, float]] = {}
+def _load_hf_db() -> tuple[dict[str, tuple[float, str, float, float | None]], dict[str, list[str]]]:
+    """(InChIKey → (ΔHf, 名称, 不確かさ, ΔHvap or None), 接続層(先頭14文字) → InChIKey 一覧) を返す."""
+    full: dict[str, tuple[float, str, float, float | None]] = {}
     by_skeleton: dict[str, list[str]] = {}
     try:
         with _DB_PATH.open(newline="", encoding="utf-8") as f:
@@ -73,6 +73,7 @@ def _load_hf_db() -> tuple[dict[str, tuple[float, str, float]], dict[str, list[s
                     float(row["hf_kJ_mol"]),
                     row["name"].strip(),
                     float(row.get("uncertainty_kJ") or 1.0),
+                    float(row["hvap_kJ_mol"]) if row.get("hvap_kJ_mol") else None,
                 )
                 by_skeleton.setdefault(key[:14], []).append(key)
     except (OSError, ValueError, KeyError):
@@ -83,8 +84,8 @@ def _load_hf_db() -> tuple[dict[str, tuple[float, str, float]], dict[str, list[s
 _HF_DB, _HF_DB_SKELETON = _load_hf_db()
 
 
-def _lookup_hf_db(canon: str) -> tuple[float, str, float, bool] | None:
-    """InChIKey で DB を引く. (ΔHf, 名称, 不確かさ, 立体異性体まで一致か)."""
+def _lookup_hf_db(canon: str) -> tuple[float, str, float, float | None, bool] | None:
+    """InChIKey で DB を引く. (ΔHf, 名称, 不確かさ, ΔHvap, 立体異性体まで一致か)."""
     mol = Chem.MolFromSmiles(canon)
     if mol is None:
         return None
@@ -95,13 +96,13 @@ def _lookup_hf_db(canon: str) -> tuple[float, str, float, bool] | None:
     if not key:
         return None
     if key in _HF_DB:
-        hf, name, unc = _HF_DB[key]
-        return hf, name, unc, True
+        hf, name, unc, hvap = _HF_DB[key]
+        return hf, name, unc, hvap, True
     # 立体情報だけが違う場合は、接続層が一意に一致するときのみ採用
     cands = _HF_DB_SKELETON.get(key[:14], [])
     if len(cands) == 1:
-        hf, name, unc = _HF_DB[cands[0]]
-        return hf, name, unc, False
+        hf, name, unc, hvap = _HF_DB[cands[0]]
+        return hf, name, unc, hvap, False
     return None
 
 
@@ -133,17 +134,24 @@ _CP_RAW: dict[str, float] = {
     "CCO":        65.56,   # C2H5OH(g)
     "CC=O":       57.32,   # CH3CHO(g)
     "CC(=O)C":    74.92,   # acetone(g)
-    "CC(=O)O":    86.5,    # CH3COOH(g)
+    "CC(=O)O":    63.4,    # CH3COOH(g, 単量体)
     "c1ccccc1":   82.44,   # benzene(g)
     "Cc1ccccc1":  103.6,   # toluene(g)
-    "CCCl":       73.6,    # chloroethane(g)
-    "BrBr":       75.73,   # Br2(g)
+    "CCCl":       62.6,    # chloroethane(g)
+    "BrBr":       36.0,    # Br2(g)
     "ClCl":       33.91,   # Cl2(g)
     "OO":         43.1,    # H2O2(g)
-    "BrCCBr":     93.4,    # 1,2-dibromoethane(g)
+    "BrCCBr":     85.3,    # 1,2-dibromoethane(g)
     "CCOC(C)=O":  113.7,   # ethyl acetate(g)
     "OC(=O)/C=C\\C(=O)O": 120.0,  # maleic acid (approx)
 }
+
+
+# 上の文献 Cp 表 (25 化合物) への線形回帰 Cp ≈ a + b × 原子数(H 含む).
+# 独立データ (Poling 344 化合物, 298 K) との比較: 平均誤差 11%, 上位 10% は約 30%.
+_CP_ATOM_INTERCEPT = 19.6
+_CP_PER_ATOM = 6.27
+CP_ROUGH_LABEL = "原子数による概算 (概ね±10〜30%)"
 
 
 def _build_cp_table() -> dict[str, float]:
@@ -368,6 +376,14 @@ def svg_to_data_uri(svg: str) -> str:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class ManualHf:
+    """手動入力した ΔHf° (kJ/mol) と、その不確かさ・出典メモ."""
+    value: float
+    uncertainty_kJ: float = 0.0
+    note: str = ""
+
+
+@dataclass
 class CompoundResult:
     smiles_input: str
     canonical_smiles: str
@@ -378,6 +394,8 @@ class CompoundResult:
     error: str = ""
     uncertainty_kJ: float | None = None
     warnings: list[str] = field(default_factory=list)
+    phase: str = "g"                    # "g": 気体, "l": 液体
+    hvap_kJ_mol: float | None = None    # 液相補正に使った ΔHvap (298.15 K)
 
 
 @dataclass
@@ -398,8 +416,8 @@ class ReactionHeatResult:
 # ΔHf° 取得
 # ---------------------------------------------------------------------------
 
-def get_hf(smiles: str, manual_hf: float | None = None) -> CompoundResult:
-    """SMILES から ΔHf° (kJ/mol) を取得する.
+def _get_hf_gas(smiles: str, manual_hf: float | ManualHf | None = None) -> CompoundResult:
+    """SMILES から気相 ΔHf° (kJ/mol) を取得する.
 
     優先順位:
         1. manual_hf が指定されている場合
@@ -420,13 +438,16 @@ def get_hf(smiles: str, manual_hf: float | None = None) -> CompoundResult:
         )
 
     if manual_hf is not None:
+        if not isinstance(manual_hf, ManualHf):
+            manual_hf = ManualHf(float(manual_hf), METHOD_UNCERTAINTY["手動入力"])
         return CompoundResult(
             smiles_input=smiles,
             canonical_smiles=canon,
             formula=formula,
-            hf_kJ_mol=manual_hf,
+            hf_kJ_mol=manual_hf.value,
             method="手動入力",
-            uncertainty_kJ=METHOD_UNCERTAINTY["手動入力"],
+            known_name=manual_hf.note,
+            uncertainty_kJ=manual_hf.uncertainty_kJ,
         )
 
     if manual_hf is None and canon in _KNOWN_HF:
@@ -444,7 +465,7 @@ def get_hf(smiles: str, manual_hf: float | None = None) -> CompoundResult:
     if manual_hf is None:
         hit = _lookup_hf_db(canon)
         if hit is not None:
-            hf, name, unc, exact = hit
+            hf, name, unc, _, exact = hit
             return CompoundResult(
                 smiles_input=smiles,
                 canonical_smiles=canon,
@@ -457,6 +478,21 @@ def get_hf(smiles: str, manual_hf: float | None = None) -> CompoundResult:
                     f"{formula}: 立体異性体が DB と異なるため {name} の値を流用しています。"
                 ],
             )
+
+    non_free = _non_free_form_reason(canon)
+    if non_free:
+        return CompoundResult(
+            smiles_input=smiles,
+            canonical_smiles=canon,
+            formula=formula,
+            hf_kJ_mol=None,
+            method="推算失敗",
+            error=(
+                f"{non_free}は基団寄与法の対象外です。反応熱の計算にはフリー体 (中性の単一分子) の "
+                "SMILES を使ってください。塩・溶媒和物そのものの値は、DFT (dft/ ディレクトリ) などで求めた値を "
+                "手動入力してください。"
+            ),
+        )
 
     ring_warns = _small_ring_warnings(canon, formula)
 
@@ -489,6 +525,18 @@ def get_hf(smiles: str, manual_hf: float | None = None) -> CompoundResult:
     )
 
 
+def _non_free_form_reason(canon: str) -> str:
+    """塩・溶媒和物・水和物・イオンなら理由を返す. 中性の単一分子なら空文字."""
+    mol = Chem.MolFromSmiles(canon)
+    if mol is None:
+        return ""
+    if len(Chem.GetMolFrags(mol)) > 1:
+        return "複数成分 (塩・溶媒和物・水和物など)"
+    if sum(a.GetFormalCharge() for a in mol.GetAtoms()) != 0:
+        return "電荷を持つイオン"
+    return ""
+
+
 def _estimate_gani(smiles: str) -> float | None:
     from ugropy import Groups
     q = Groups(smiles, "smiles").agani.ig_formation_enthalpy
@@ -515,6 +563,93 @@ def _small_ring_warnings(canon: str, formula: str) -> list[str]:
     ]
 
 
+# 298.15 K での蒸発エンタルピー (kJ/mol). 組込み文献値表にある化合物用
+_KNOWN_HVAP: dict[str, float] = {
+    "O": 44.0,
+    "CO": 37.4,
+    "CCO": 42.3,
+    "c1ccccc1": 33.9,
+    "Cc1ccccc1": 38.0,
+    "CC(C)=O": 31.0,
+    "ClC(Cl)Cl": 31.4,
+    "BrBr": 30.91,
+}
+
+
+def get_hvap(smiles: str) -> tuple[float | None, float, str]:
+    """298.15 K の蒸発エンタルピー (kJ/mol), 不確かさ, 由来を返す.
+
+    優先順位: 組込み表 → data/hf_gas.csv → Joback 法の ΔHvap(Tb) を Watson 式で 298 K へ換算.
+    """
+    valid, canon, _ = validate_smiles(smiles)
+    if not valid:
+        return None, 0.0, ""
+    if canon in _KNOWN_HVAP:
+        return _KNOWN_HVAP[canon], 1.0, "文献値"
+    hit = _lookup_hf_db(canon)
+    if hit is not None and hit[3] is not None:
+        return hit[3], 1.0, "文献値"
+    try:
+        from ugropy import joback
+        r = joback.get_groups(smiles, identifier_type="smiles")
+        hb, tb, tc = r.vaporization_enthalpy, r.normal_boiling_point, r.critical_temperature
+        if hb is None or tb is None or tc is None:
+            return None, 0.0, ""
+        hb_v, tb_v, tc_v = float(hb.magnitude), float(tb.magnitude), float(tc.magnitude)
+        t0 = 298.15
+        if tc_v <= t0:
+            return None, 0.0, ""
+        # Watson 式: ΔHvap(T) = ΔHvap(Tb) × ((1 − T/Tc) / (1 − Tb/Tc))^0.38
+        hv = hb_v * ((1 - t0 / tc_v) / (1 - tb_v / tc_v)) ** 0.38
+        return hv, max(4.0, 0.15 * hv), "Joback+Watson"
+    except Exception:
+        return None, 0.0, ""
+
+
+def get_hf(
+    smiles: str,
+    manual_hf: float | None = None,
+    phase: str = "g",
+) -> CompoundResult:
+    """ΔHf° (kJ/mol) を取得する. phase="l" のときは気相値から ΔHvap を引いて液相値にする.
+
+    手動入力値は指定した相の値としてそのまま使う (相補正はしない).
+    """
+    cr = _get_hf_gas(smiles, manual_hf)
+    if phase != "l" or manual_hf is not None or cr.hf_kJ_mol is None:
+        cr.phase = "l" if phase == "l" else "g"
+        return cr
+
+    cr.phase = "l"
+    hvap, hvap_unc, origin = get_hvap(smiles)
+    if hvap is None:
+        cr.hf_kJ_mol = None
+        cr.method = "推算失敗"
+        cr.error = "蒸発エンタルピーを取得できず、液相の ΔHf° を求められません。手動入力してください。"
+        return cr
+    cr.hf_kJ_mol -= hvap
+    cr.hvap_kJ_mol = hvap
+    cr.uncertainty_kJ = math.hypot(cr.uncertainty_kJ or 0.0, hvap_unc)
+    if origin != "文献値":
+        cr.warnings.append(
+            f"{cr.formula}: ΔHvap を Joback 法 + Watson 式で推算しています (約 ±15%)。"
+        )
+    if cr.canonical_smiles and cr.method != "推算失敗":
+        cr.warnings.extend(_gas_at_room_temp_warning(smiles, cr.formula))
+    return cr
+
+
+def _gas_at_room_temp_warning(smiles: str, formula: str) -> list[str]:
+    try:
+        from ugropy import joback
+        tb = joback.get_groups(smiles, identifier_type="smiles").normal_boiling_point
+    except Exception:
+        return []
+    if tb is not None and float(tb.magnitude) < 298.15:
+        return [f"{formula}: 常圧の沸点が 298 K 未満のため、液体として存在するには加圧・冷却が必要です。"]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Cp 推定
 # ---------------------------------------------------------------------------
@@ -528,6 +663,9 @@ def get_cp_estimate(smiles: str) -> tuple[float | None, str]:
     if canon in _KNOWN_CP:
         return _KNOWN_CP[canon], "文献値 (定数近似)"
 
+    if _non_free_form_reason(canon):
+        return None, "推算不可"
+
     try:
         from ugropy import joback
         result = joback.get_groups(smiles, identifier_type="smiles")
@@ -539,7 +677,9 @@ def get_cp_estimate(smiles: str) -> tuple[float | None, str]:
     except Exception:
         pass
 
-    return None, "推算不可"
+    # Joback 法に基団がない化合物 (硫黄系など): 原子数による概算
+    mol = Chem.AddHs(Chem.MolFromSmiles(canon))
+    return _CP_ATOM_INTERCEPT + _CP_PER_ATOM * mol.GetNumAtoms(), CP_ROUGH_LABEL
 
 
 # ---------------------------------------------------------------------------
@@ -565,15 +705,24 @@ def calc_kirchhoff_correction(
     )
 
     missing: list[str] = []
+    rough: list[str] = []
     for coeff, smiles, sign in all_species:
         if not smiles.strip():
             continue
-        cp, _ = get_cp_estimate(smiles)
+        cp, cp_method = get_cp_estimate(smiles)
         if cp is None:
             _, canon, formula = validate_smiles(smiles)
             missing.append(formula or smiles)
         else:
             delta_cp += sign * coeff * cp
+            if cp_method == CP_ROUGH_LABEL:
+                rough.append(validate_smiles(smiles)[2] or smiles)
+
+    if rough:
+        warnings.append(
+            f"Cp を原子数から概算した化合物 ({', '.join(rough)}) があります。"
+            "温度補正は目安として扱ってください。"
+        )
 
     if missing:
         warnings.append(
@@ -594,14 +743,18 @@ def calc_reaction_heat(
     products: list[tuple[float, str, float | None]],
     temperature_K: float = 298.15,
     solvent_correction_kJ: float = 0.0,
+    reactant_phases: list[str] | None = None,
+    product_phases: list[str] | None = None,
 ) -> ReactionHeatResult:
     """反応熱を計算する.
 
     Args:
-        reactants:              [(係数, SMILES, manual_hf or None), ...]
-        products:               [(係数, SMILES, manual_hf or None), ...]
+        reactants:              [(係数, SMILES, ManualHf | float | None), ...]
+        products:               [(係数, SMILES, ManualHf | float | None), ...]
         temperature_K:          計算温度 (K)。デフォルト 298.15 K。
         solvent_correction_kJ:  溶媒補正値 (kJ/mol)。ユーザー手動入力。
+        reactant_phases:        反応物ごとの相 ("g" 気体 / "l" 液体)。省略時は全て気体。
+        product_phases:         生成物ごとの相。省略時は全て気体。
 
     Returns:
         ReactionHeatResult
@@ -611,22 +764,25 @@ def calc_reaction_heat(
     product_results: list[tuple[float, CompoundResult]] = []
     all_ok = True
 
-    for coeff, smiles, manual_hf in reactants:
-        cr = get_hf(smiles, manual_hf)
+    r_phases = reactant_phases or ["g"] * len(reactants)
+    p_phases = product_phases or ["g"] * len(products)
+
+    for (coeff, smiles, manual_hf), ph in zip(reactants, r_phases):
+        cr = get_hf(smiles, manual_hf, ph)
         reactant_results.append((coeff, cr))
         if cr.hf_kJ_mol is None:
             all_ok = False
             warnings_all.append(
-                f"反応物 {cr.formula or smiles}: ΔHf° を取得できませんでした。手動入力してください。"
+                f"反応物 {cr.formula or smiles}: ΔHf° を取得できませんでした。" + (cr.error or "手動入力してください。")
             )
 
-    for coeff, smiles, manual_hf in products:
-        cr = get_hf(smiles, manual_hf)
+    for (coeff, smiles, manual_hf), ph in zip(products, p_phases):
+        cr = get_hf(smiles, manual_hf, ph)
         product_results.append((coeff, cr))
         if cr.hf_kJ_mol is None:
             all_ok = False
             warnings_all.append(
-                f"生成物 {cr.formula or smiles}: ΔHf° を取得できませんでした。手動入力してください。"
+                f"生成物 {cr.formula or smiles}: ΔHf° を取得できませんでした。" + (cr.error or "手動入力してください。")
             )
 
     if not all_ok:
@@ -657,6 +813,13 @@ def calc_reaction_heat(
         (c * (r.uncertainty_kJ or 0.0)) ** 2
         for c, r in reactant_results + product_results
     ))
+
+    if any(r.phase == "l" for _, r in reactant_results + product_results):
+        if abs(temperature_K - 298.15) > 1.0:
+            warnings_all.append(
+                "液相の化合物を含みますが、温度補正 (Kirchhoff) は気相 Cp で計算しています。"
+                "液相 Cp は気相より大きいため、補正量は目安です。"
+            )
 
     delta_H_gas = (
         sum(c * r.hf_kJ_mol for c, r in product_results)

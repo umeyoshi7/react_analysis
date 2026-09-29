@@ -8,6 +8,7 @@ from src.thermochemistry import (
     COMMON_MOLECULES,
     REACTION_TEMPLATES,
     SOLVENT_DATA,
+    ManualHf,
     assess_process_safety,
     calc_reaction_heat,
     calc_td24_arrhenius,
@@ -89,17 +90,30 @@ with st.sidebar:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _manual_of(row: dict) -> ManualHf | None:
+    """入力行から手動入力値 (不確かさ・メモ付き) を作る. 手動入力でなければ None."""
+    if not row.get("use_manual"):
+        return None
+    return ManualHf(
+        float(row["manual_hf"]),
+        float(row.get("manual_unc", 10.0)),
+        row.get("manual_note", "").strip(),
+    )
+
+
 def _render_compound_rows(rows: list[dict], role: str, key_prefix: str) -> None:
     """反応物 / 生成物の入力行を描画し、rows を in-place で更新する."""
-    header = st.columns([3.5, 1.2, 1.8, 2.0, 0.7])
+    widths = [3.0, 1.1, 1.6, 1.0, 2.0, 0.7]
+    header = st.columns(widths)
     header[0].caption("SMILES")
     header[1].caption("係数")
     header[2].caption("化学式")
-    header[3].caption("ΔHf° 手動入力 (kJ/mol)")
-    header[4].caption("削除")
+    header[3].caption("相")
+    header[4].caption("ΔHf° 手動入力 (kJ/mol)")
+    header[5].caption("削除")
 
     for idx, row in enumerate(rows):
-        c1, c2, c3, c4, c5 = st.columns([3.5, 1.2, 1.8, 2.0, 0.7])
+        c1, c2, c3, c_ph, c4, c5 = st.columns(widths)
 
         with c1:
             smiles_val = st.text_input(
@@ -133,6 +147,18 @@ def _render_compound_rows(rows: list[dict], role: str, key_prefix: str) -> None:
             else:
                 st.caption("—")
 
+        with c_ph:
+            phase_val = st.selectbox(
+                "相",
+                ["g", "l"],
+                index=1 if row.get("phase") == "l" else 0,
+                format_func=lambda x: "気体" if x == "g" else "液体",
+                key=f"{key_prefix}_phase_{idx}",
+                label_visibility="collapsed",
+                help="液体を選ぶと、気相 ΔHf° から蒸発エンタルピー (298 K) を引いて液相値にします。",
+            )
+            rows[idx]["phase"] = phase_val
+
         with c4:
             use_manual = st.checkbox(
                 "手動入力",
@@ -151,6 +177,21 @@ def _render_compound_rows(rows: list[dict], role: str, key_prefix: str) -> None:
                     label_visibility="collapsed",
                 )
                 rows[idx]["manual_hf"] = manual_val
+                rows[idx]["manual_unc"] = st.number_input(
+                    "不確かさ ± (kJ/mol)",
+                    value=float(row.get("manual_unc", 10.0)),
+                    min_value=0.0,
+                    step=1.0,
+                    format="%.1f",
+                    key=f"{key_prefix}_munc_{idx}",
+                    help="実測値なら ±1〜2、DFT なら ±10 前後が目安。ΔH_rxn の不確かさに反映されます。",
+                )
+                rows[idx]["manual_note"] = st.text_input(
+                    "出典メモ",
+                    value=row.get("manual_note", ""),
+                    key=f"{key_prefix}_mnote_{idx}",
+                    placeholder="出典・手法 (例: DFT B3LYP/def2-SVP)",
+                )
             else:
                 st.caption("自動推算")
 
@@ -430,11 +471,11 @@ with col_clear:
 
 if calc_btn:
     reactants_in = [
-        (r["coeff"], r["smiles"], r["manual_hf"] if r["use_manual"] else None)
+        (r["coeff"], r["smiles"], _manual_of(r))
         for r in thermo_r if r["smiles"].strip()
     ]
     products_in = [
-        (p["coeff"], p["smiles"], p["manual_hf"] if p["use_manual"] else None)
+        (p["coeff"], p["smiles"], _manual_of(p))
         for p in thermo_p if p["smiles"].strip()
     ]
     with st.spinner("計算中…"):
@@ -443,6 +484,8 @@ if calc_btn:
             products_in,
             temperature_K=temperature_K,
             solvent_correction_kJ=solvent_correction,
+            reactant_phases=[r.get("phase", "g") for r in thermo_r if r["smiles"].strip()],
+            product_phases=[p.get("phase", "g") for p in thermo_p if p["smiles"].strip()],
         )
 
 # ── 結果表示 ─────────────────────────────────────────────────────────────────
@@ -497,9 +540,11 @@ if result is not None:
                 "化学式": cr.formula,
                 "SMILES": cr.canonical_smiles,
                 "係数 ν": f"−{coeff:.2f}",
+                "相": "液体" if cr.phase == "l" else "気体",
                 "ΔHf° (kJ/mol)": f"{cr.hf_kJ_mol:.2f}",
                 "寄与 (kJ/mol)": f"{-coeff * cr.hf_kJ_mol:+.2f}",
-                "計算手法": cr.method + (f" [{cr.known_name}]" if cr.known_name else ""),
+                "計算手法": cr.method + (f" [{cr.known_name}]" if cr.known_name else "")
+                + (f" − ΔHvap {cr.hvap_kJ_mol:.1f}" if cr.hvap_kJ_mol is not None else ""),
             })
         for coeff, cr in result.product_results:
             rows_data.append({
@@ -507,9 +552,11 @@ if result is not None:
                 "化学式": cr.formula,
                 "SMILES": cr.canonical_smiles,
                 "係数 ν": f"+{coeff:.2f}",
+                "相": "液体" if cr.phase == "l" else "気体",
                 "ΔHf° (kJ/mol)": f"{cr.hf_kJ_mol:.2f}",
                 "寄与 (kJ/mol)": f"{coeff * cr.hf_kJ_mol:+.2f}",
-                "計算手法": cr.method + (f" [{cr.known_name}]" if cr.known_name else ""),
+                "計算手法": cr.method + (f" [{cr.known_name}]" if cr.known_name else "")
+                + (f" − ΔHvap {cr.hvap_kJ_mol:.1f}" if cr.hvap_kJ_mol is not None else ""),
             })
         st.dataframe(pd.DataFrame(rows_data), width="stretch", hide_index=True)
 

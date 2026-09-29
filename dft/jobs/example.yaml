@@ -1,0 +1,41 @@
+# Vertex AI で実行する DFT ΔHf° 推算ジョブの例
+job_name: exatecan-linker
+
+# 計算レベル。校正 (calibrate) と同じ値にすること。
+level:
+  xc: b3lyp
+  basis: def2-svp
+  disp: d3bj
+  xtb_method: GFN2-xTB
+  temperature_K: 298.15
+
+# 配座探索。回転可能結合が多い分子ほど n_conformers / n_keep を増やす (時間は n_keep にほぼ比例)。
+sampling:
+  n_conformers: 30    # RDKit で生成する配座数
+  n_keep: 5           # そのうち MMFF が低い順に xTB 最適化する数
+  n_orient: 8         # 塩・溶媒和物: 成分の初期配置の乱数パターン数
+
+resources:
+  threads: 32
+  max_memory_gb: 200
+
+# calibrate ジョブが出力した校正ファイル (run では必須)
+calibration: gs://YOUR_BUCKET/hf-dft/calibration/calibration_b3lyp_def2-svp_d3bj.json
+
+compounds:
+  - id: dxd_linker
+    name: エクサテカン系リンカー (マレイミド末端)
+    smiles: "CC[C@@]1(O)C(=O)OCC2=C1C=C3N(Cc4c5[C@H](CCc6c(C)c(F)cc(nc34)c56)NC(=O)COCNC(=O)CNC(=O)[C@H](Cc7ccccc7)NC(=O)CNC(=O)CNC(=O)CCCCCN8C(=O)C=CC8=O)C2=O"
+
+  # 溶媒和物 (自動判定: 中性の複数成分 = solvate)。フリー体はアセトアミドと判定される。
+  - id: acetamide_hydrate
+    name: アセトアミド一水和物 (例)
+    smiles: "CC(N)=O.O"
+
+  # 塩。フリー体は中和したアミンと判定される。固体の値にするには、固体 → 気相イオン対の
+  # エンタルピー (実測または周期系計算) を sublimation_enthalpy_kJ_mol で与える。
+  - id: ethylamine_hcl
+    name: エチルアミン塩酸塩 (例)
+    smiles: "CC[NH3+].[Cl-]"
+    free_form_smiles: "CCN"        # 省略すると自動判定
+    # sublimation_enthalpy_kJ_mol: 200.0

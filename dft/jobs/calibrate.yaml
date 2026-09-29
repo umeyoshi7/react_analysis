@@ -1,0 +1,7 @@
+# 校正ジョブ: reference_set.csv の全分子を計算し、原子当量 + 結合補正の係数をフィットする
+job_name: calibrate
+level: {xc: b3lyp, basis: def2-svp, disp: d3bj, xtb_method: GFN2-xTB}
+sampling: {n_conformers: 20, n_keep: 3, n_orient: 4}
+# 小分子が多いので、1 ワーカーあたり少ないスレッドで多数並列にする方が速い
+resources: {threads: 32, workers: 8}
+reference_max_heavy: 14
